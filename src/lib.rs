@@ -4,7 +4,6 @@
 use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 use std::cell::UnsafeCell;
@@ -545,12 +544,10 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                         let meta = bucket.meta.load(Ordering::Acquire);
                         let new_meta = set_byte(meta, EMPTY_SLOT, slot);
                         bucket.meta.store(new_meta, Ordering::Release);
-
+                        root.unlock();
                         // Update counter
                         let stripe = hash64 as usize % NUM_STRIPES;
                         table.counters[stripe].fetch_sub(1, Ordering::Relaxed);
-
-                        root.unlock();
                         self.maybe_resize_after_remove(table);
                         return (Some(old_val), None);
                     }
@@ -723,19 +720,19 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         self.len() == 0
     }
 
-    // pub fn clear(&self) {
-    //     self.try_resize(ResizeHint::Clear);
-    // }
+    pub fn clear(&self) {
+        self.try_resize(ResizeHint::Clear);
+    }
 
     fn seq_load_table(&self) -> &Table<K, V> {
-        //loop {
-        let table_ptr = self.table.load(Ordering::Acquire);
-        // if table_ptr.is_null() {
-        //     std::thread::yield_now();
-        //     continue;
-        // }
-        return unsafe { &*table_ptr };
-        //}
+        loop {
+            let table_ptr = self.table.load(Ordering::Acquire);
+            if table_ptr.is_null() {
+                std::thread::yield_now();
+                continue;
+            }
+            return unsafe { &*table_ptr };
+        }
     }
 
     #[inline]
@@ -743,7 +740,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         use std::hash::Hasher;
         let mut h = self.hasher.build_hasher();
         key.hash(&mut h);
-        let hv = h.finish();
+        let hv = h.finish().max(1);
         (hv, self.h2(hv))
     }
 
@@ -759,9 +756,8 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     fn sum_counters(&self, table: &Table<K, V>) -> usize {
         let mut s = 0usize;
         for i in 0..NUM_STRIPES {
-            // 使用饱和加法防止并发下计数器异常导致的调试溢出
             let c = table.counters[i].load(Ordering::Relaxed) as usize;
-            s = s.saturating_add(c);
+            s = s.wrapping_add(c);
         }
         s
     }
@@ -802,20 +798,14 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         let old_table = self.seq_load_table();
         let old_len = old_table.mask + 1;
 
-        // Check if resize is actually needed
-        let new_len = match hint {
-            ResizeHint::Grow => old_len * 2,
-            ResizeHint::Shrink => {
-                if old_len <= MIN_TABLE_LEN {
-                    return; // No shrink needed
-                }
-                old_len / 2
+        if hint == ResizeHint::Shrink {
+            if old_len <= MIN_TABLE_LEN {
+                return; // No shrink needed
             }
-            ResizeHint::Clear => MIN_TABLE_LEN,
-        };
+        }
 
         // Calculate parallelism for the resize operation
-        let (workers, _chunks) = if old_len >= ASYNC_THRESHOLD && num_cpus::get() > 1 {
+        let (_, _chunks) = if old_len >= ASYNC_THRESHOLD && num_cpus::get() > 1 {
             calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get())
         } else {
             (1, 1)
@@ -879,16 +869,16 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         }
 
         let new_table = &*new_table_ptr;
-        let chunks = state.chunks.load(Ordering::Acquire);
+        //let chunks = state.chunks.load(Ordering::Acquire);
         // 等待 finalize_resize 设置 chunks，避免为 0 导致溢出
-        while chunks == 0 {
-            std::thread::yield_now();
-            // 重新加载
-            let c = state.chunks.load(Ordering::Acquire);
-            if c > 0 {
-                break;
-            }
-        }
+        // while chunks == 0 {
+        //     std::thread::yield_now();
+        //     // 重新加载
+        //     let c = state.chunks.load(Ordering::Acquire);
+        //     if c > 0 {
+        //         break;
+        //     }
+        // }
         let chunks = state.chunks.load(Ordering::Acquire);
 
         // Calculate chunk size
@@ -965,11 +955,10 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         if is_growth {
             // Growth: only lock source buckets, not destination buckets
             for i in start..end {
-                total_copied += self.copy_bucket_lock(&old_table.buckets[i], new_table);
+                total_copied += self.copy_bucket(&old_table.buckets[i], new_table);
             }
         } else {
             // Shrink: lock both source and destination buckets
-
             for i in start..end {
                 total_copied += self.copy_bucket_lock(&old_table.buckets[i], new_table);
             }
@@ -1037,12 +1026,10 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                         let next_ptr = current_dest.next.load(Ordering::Acquire);
                         if next_ptr.is_null() {
                             // Create new overflow bucket
-                            unsafe {
-                                let new_bucket =
-                                    Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
-                                let new_ptr = Box::into_raw(new_bucket);
-                                current_dest.next.store(new_ptr, Ordering::Release);
-                            }
+                            let new_bucket =
+                                Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
+                            let new_ptr = Box::into_raw(new_bucket);
+                            current_dest.next.store(new_ptr, Ordering::Release);
                             break 'append_to;
                         } else {
                             current_dest = unsafe { &*next_ptr };
@@ -1050,6 +1037,91 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     }
 
                     dest_bucket.unlock();
+                    copied += 1;
+                }
+                marked &= marked - 1;
+            }
+
+            // Move to next bucket in chain
+            let next_ptr = current.next.load(Ordering::Acquire);
+            if next_ptr.is_null() {
+                break;
+            }
+            current = unsafe { &*next_ptr };
+        }
+
+        bucket.unlock();
+        copied
+    }
+
+    fn copy_bucket(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
+    where
+        K: Clone + Eq + std::hash::Hash,
+        V: Clone,
+    {
+        // Lock the source bucket to stabilize the chain
+        bucket.lock();
+
+        let mut copied = 0;
+        let mut current = bucket;
+        loop {
+            let entries_ref = unsafe { &*current.entries.get() };
+            let meta = current.meta.load(Ordering::Relaxed);
+            let mut marked = meta & META_MASK;
+
+            while marked != 0 {
+                let j = first_marked_byte_index(marked);
+                let entry = &entries_ref[j];
+
+                // Check if slot is marked as occupied and entry is occupied
+                if (meta >> (j * 8)) & 0x80 != 0 && entry.is_occupied() {
+                    let key = unsafe { entry.key.assume_init_ref().clone() };
+                    let val = unsafe { entry.val.assume_init_ref().clone() };
+                    let (hash64, h2) = self.hash_pair(&key);
+
+                    // For shrink operations, lock destination bucket during insertion
+                    let idx = self.h1_mask(hash64, new_table.mask);
+                    let dest_bucket = &new_table.buckets[idx];
+                    //dest_bucket.lock();
+
+                    // Direct insertion into destination bucket (like Go's appendTo loop)
+                    let mut current_dest = dest_bucket;
+                    'append_to: loop {
+                        let dest_meta = current_dest.meta.load(Ordering::Relaxed);
+                        let empty = (!dest_meta) & META_MASK;
+
+                        if empty != 0 {
+                            // Found empty slot
+                            let empty_idx = first_marked_byte_index(empty);
+                            let new_meta = set_byte(dest_meta, h2, empty_idx);
+
+                            unsafe {
+                                // Follow Go's order: meta first, then value, hash, key
+                                current_dest.meta.store(new_meta, Ordering::Release);
+                                let dest_entries = &mut *current_dest.entries.get();
+                                dest_entries[empty_idx].val.as_mut_ptr().write(val.clone());
+                                dest_entries[empty_idx].set_hash(hash64);
+                                dest_entries[empty_idx].key.as_mut_ptr().write(key.clone());
+                            }
+                            break 'append_to;
+                        }
+
+                        // No empty slot, check for next bucket
+                        let next_ptr = current_dest.next.load(Ordering::Acquire);
+                        if next_ptr.is_null() {
+                            // Create new overflow bucket
+                            let new_bucket =
+                                Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
+                            let new_ptr = Box::into_raw(new_bucket);
+                            current_dest.next.store(new_ptr, Ordering::Release);
+
+                            break 'append_to;
+                        } else {
+                            current_dest = unsafe { &*next_ptr };
+                        }
+                    }
+
+                    //dest_bucket.unlock();
                     copied += 1;
                 }
                 marked &= marked - 1;
@@ -1106,6 +1178,17 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
         });
 
+        if state.hint == ResizeHint::Clear {
+            self.table
+                .store(Box::into_raw(new_table), Ordering::Release);
+
+            // Clear resize state
+            self.resize_state
+                .store(std::ptr::null_mut(), Ordering::Release);
+
+            return;
+        }
+
         // Store the new table in the resize state
         // 先发布 chunks，再发布 new_table，避免并发读取到 new_table 非空但 chunks 仍为 0
         state.chunks.store(chunks as i32, Ordering::Release);
@@ -1120,105 +1203,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
 
         // Clean up resize state (help_copy_and_wait handles table swap and resize_state cleanup)
         let _ = Box::from_raw(state as *const _ as *mut ResizeState<K, V>);
-    }
-
-    // Reinsertion helper used by resize: inserts into provided table
-    fn reinsert_into(&self, table: &Table<K, V>, hash64: u64, h2: u8, key: K, val: V)
-    where
-        K: Clone + Eq,
-        V: Clone,
-    {
-        let idx = self.h1_mask(hash64, table.mask);
-        let root = &table.buckets[idx];
-        root.lock();
-        let mut found_bucket: *const Bucket<K, V> = std::ptr::null();
-        let mut found_idx: usize = 0;
-        let mut empty_slot: Option<(*const Bucket<K, V>, usize)> = None;
-        let mut cur: &Bucket<K, V> = root;
-        loop {
-            let meta = cur.meta.load(Ordering::Relaxed);
-            let h2w = broadcast(h2);
-            let mut marked = mark_zero_bytes(meta ^ h2w);
-            let entries_ref = unsafe { &*cur.entries.get() };
-            while marked != 0 {
-                let j = first_marked_byte_index(marked);
-                let e = &entries_ref[j];
-                // Check hash matching (slot is already marked as occupied)
-                if e.is_occupied() && e.equal_hash(hash64) {
-                    unsafe {
-                        if *e.key.as_ptr() == key {
-                            found_bucket = cur as *const _;
-                            found_idx = j;
-                            break;
-                        }
-                    }
-                }
-                marked &= marked - 1;
-            }
-            if found_bucket.is_null() {
-                if empty_slot.is_none() {
-                    let empty = (!meta) & META_MASK;
-                    if empty != 0 {
-                        empty_slot = Some((cur as *const _, first_marked_byte_index(empty)));
-                    }
-                }
-                let next_ptr = cur.next.load(Ordering::Acquire);
-                if !next_ptr.is_null() {
-                    cur = unsafe { &*next_ptr };
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        if !found_bucket.is_null() {
-            unsafe {
-                let s = (*found_bucket).seq.load(Ordering::Relaxed);
-                (*found_bucket).seq.store(s + 1, Ordering::Release);
-                let entries_mut = &mut *(*found_bucket).entries.get();
-                // Properly drop the old value before writing new one
-                std::ptr::drop_in_place(entries_mut[found_idx].val.as_mut_ptr());
-                entries_mut[found_idx].val.as_mut_ptr().write(val.clone());
-                (*found_bucket).seq.store(s + 2, Ordering::Release);
-            }
-            root.unlock();
-            return;
-        }
-
-        if let Some((eb, ei)) = empty_slot {
-            unsafe {
-                let entries_mut = &mut *(*eb).entries.get();
-                // Always set hash field for occupancy checking
-                entries_mut[ei].set_hash(hash64);
-                entries_mut[ei].key.as_mut_ptr().write(key);
-                entries_mut[ei].val.as_mut_ptr().write(val);
-                let new_meta = set_byte((*eb).meta.load(Ordering::Relaxed), h2, ei);
-                let s = (*eb).seq.load(Ordering::Relaxed);
-                (*eb).seq.store(s + 1, Ordering::Release);
-                (*eb).meta.store(new_meta, Ordering::Release);
-                (*eb).seq.store(s + 2, Ordering::Release);
-            }
-            root.unlock();
-            let stripe = stripe_index(hash64);
-            table.counters[stripe].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        // Prepend overflow bucket when no empty slot available
-        unsafe {
-            let new_bucket = Box::new(Bucket::single(hash64, h2, key, val));
-            let new_ptr = Box::into_raw(new_bucket);
-            let old_ptr = root.next.load(Ordering::Acquire);
-            (*new_ptr).next.store(old_ptr, Ordering::Relaxed);
-            root.next.store(new_ptr, Ordering::Release);
-        }
-        root.unlock();
-
-        let stripe = stripe_index(hash64);
-        table.counters[stripe].fetch_add(1, Ordering::Relaxed);
-        return;
     }
 }
 
@@ -1356,28 +1340,19 @@ impl<K, V> Entry<K, V> {
     /// Check if this entry is initialized (occupied)
     #[inline]
     fn is_occupied(&self) -> bool {
-        // (self.hash & HASH_INIT_FLAG) != 0
         self.hash != 0
     }
 
     /// Get the actual hash value (without the init flag)
     #[inline]
     fn equal_hash(&self, hash64: u64) -> bool {
-        //(self.hash & !HASH_INIT_FLAG) == (hash64 & !HASH_INIT_FLAG)
         self.hash == hash64
     }
 
     /// Set the hash with the init flag
     #[inline]
     fn set_hash(&mut self, hash64: u64) {
-        // Always set the init flag, clear it from input hash first to avoid double-setting
-        // self.hash = hash64 | HASH_INIT_FLAG;
-        self.hash = hash64.max(1)
-        // if hash64 == 0 {
-        //     self.hash = 1;
-        // } else {
-        //     self.hash = hash64;
-        // }
+        self.hash = hash64
     }
 
     /// Clear the entry (mark as unoccupied)
