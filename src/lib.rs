@@ -1179,8 +1179,14 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         });
 
         if state.hint == ResizeHint::Clear {
-            self.table
-                .store(Box::into_raw(new_table), Ordering::Release);
+            // Swap to new empty table
+            let old_table_ptr = self.table.swap(Box::into_raw(new_table), Ordering::AcqRel);
+            
+            // Add old table to cleanup list
+            unsafe {
+                let old_tables = &mut *self.old_tables.get();
+                old_tables.push(Box::from_raw(old_table_ptr));
+            }
 
             // Clear resize state
             self.resize_state
