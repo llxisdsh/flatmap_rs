@@ -1,0 +1,27 @@
+[package]
+name = "flatmapof"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "flatmapof"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# Enable storing embedded hash in entries to speed equality short-circuits
+embedded_hash = []
+# Enable extra padding to align hot structs to cache lines
+padding = []
+
+[dependencies]
+ahash = "0.8"
+num_cpus = "1.0"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "basic"
+harness = false
