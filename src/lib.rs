@@ -112,7 +112,6 @@ struct Bucket<K, V> {
 unsafe impl<K: Send, V: Send> Send for Bucket<K, V> {}
 unsafe impl<K: Sync, V: Sync> Sync for Bucket<K, V> {}
 
-#[cfg_attr(feature = "padding", repr(align(64)))]
 struct Entry<K, V> {
     hash: u64, // Highest bit indicates if entry is initialized, remaining 63 bits are actual hash
     key: MaybeUninit<K>,

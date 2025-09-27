@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 
 #[test]
 fn test_insert_get_remove_string() {
@@ -79,7 +79,7 @@ fn test_basic_integer_keys() {
 
 #[test]
 fn test_edge_cases_strings() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     let m: FlatMap<String, String> = FlatMap::new();
 
     // Empty string key
@@ -104,7 +104,7 @@ fn test_edge_cases_strings() {
 
 #[test]
 fn test_multiple_keys_and_deletions() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     let m: FlatMap<i32, String> = FlatMap::new();
 
     // Insert multiple keys
@@ -136,7 +136,7 @@ fn test_multiple_keys_and_deletions() {
 
 #[test]
 fn test_size_and_is_empty_semantics() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     let m: FlatMap<i32, String> = FlatMap::new();
 
     // Initially empty
@@ -160,7 +160,7 @@ fn test_size_and_is_empty_semantics() {
 
 #[test]
 fn test_for_each_early_termination() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     let m: FlatMap<i32, i32> = FlatMap::new();
     for i in 0..20 {
         let _ = m.insert(i, i * 3);
@@ -176,7 +176,7 @@ fn test_for_each_early_termination() {
 
 #[test]
 fn test_iter_consistency() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     let m: FlatMap<i32, String> = FlatMap::new();
     for i in 0..10 {
         let _ = m.insert(i, format!("v{}", i));

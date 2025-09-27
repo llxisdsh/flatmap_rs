@@ -1,4 +1,4 @@
-use flatmapof::{FlatMap, Op};
+use flatmap_rs::{FlatMap, Op};
 
 #[test]
 fn test_get_after_range_delete() {

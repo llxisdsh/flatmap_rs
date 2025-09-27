@@ -1,4 +1,4 @@
-use flatmapof::{FlatMap, Op};
+use flatmap_rs::{FlatMap, Op};
 
 fn main() {
     let map = FlatMap::new();

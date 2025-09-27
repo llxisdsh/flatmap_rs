@@ -1,27 +1,36 @@
 [package]
-name = "flatmapof"
+name = "flatmap_rs"
 version = "0.1.0"
 edition = "2021"
+authors = ["llxisdsh"]
+description = "A high-performance concurrent flat hash map implementation in Rust"
+repository = "https://github.com/llxisdsh/flatmap_rs"
+homepage = "https://github.com/llxisdsh/flatmap_rs"
+documentation = "https://docs.rs/flatmap_rs"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
+keywords = ["hashmap", "concurrent", "lock-free", "performance", "data-structures"]
+categories = ["data-structures", "concurrency", "algorithms"]
+rust-version = "1.70"
 
 [lib]
-name = "flatmapof"
+name = "flatmap_rs"
 path = "src/lib.rs"
-crate-type = ["rlib"]
 
 [features]
-# Enable storing embedded hash in entries to speed equality short-circuits
-embedded_hash = []
-# Enable extra padding to align hot structs to cache lines
-padding = []
+default = ["ahash"]
+ahash = ["dep:ahash"]
+std = []
 
 [dependencies]
-ahash = "0.8"
+ahash = { version = "0.8", optional = true }
 num_cpus = "1.0"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+dashmap = "6.0"
 
 [[bench]]
-name = "basic"
+name = "flatmap"
 harness = false

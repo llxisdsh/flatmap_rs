@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 use std::sync::Arc;
 use std::thread;
 

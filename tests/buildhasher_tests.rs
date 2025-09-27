@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 

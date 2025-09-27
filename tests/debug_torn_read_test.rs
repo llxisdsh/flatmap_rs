@@ -1,4 +1,4 @@
-use flatmapof::{FlatMap, Op};
+use flatmap_rs::{FlatMap, Op};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;

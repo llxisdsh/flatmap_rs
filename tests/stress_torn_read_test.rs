@@ -1,4 +1,4 @@
-use flatmapof::{FlatMap, Op};
+use flatmap_rs::{FlatMap, Op};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;

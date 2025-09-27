@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 
 #[test]
 fn test_simple_get() {

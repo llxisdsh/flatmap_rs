@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 
 fn main() {
     println!("=== 调试 get_or_insert_with ===");

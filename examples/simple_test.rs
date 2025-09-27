@@ -1,4 +1,4 @@
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 
 fn main() {
     println!("Creating FlatMap...");

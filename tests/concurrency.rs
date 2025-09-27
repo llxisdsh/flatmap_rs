@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use flatmapof::FlatMap;
+use flatmap_rs::FlatMap;
 
 #[test]
 fn concurrent_mixed_ops_string_keys() {
@@ -80,7 +80,7 @@ fn concurrent_integer_keys_contention() {
 
 #[test]
 fn concurrent_load_or_insert_once_under_race() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     use std::sync::atomic::AtomicI32;
     use std::sync::Arc;
     use std::thread;
@@ -116,7 +116,7 @@ fn concurrent_load_or_insert_once_under_race() {
 
 #[test]
 fn double_buffer_consistency_under_updates() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -177,7 +177,7 @@ fn seqlock_consistency_stress_aba() {
         x: u64,
         y: u64,
     }
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -229,7 +229,7 @@ fn seqlock_consistency_stress_aba() {
 
 #[test]
 fn load_delete_race_semantics() {
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
     use std::thread;
@@ -300,7 +300,7 @@ fn key_torn_read_stress() {
         a: u64,
         b: u64,
     }
-    use flatmapof::FlatMap;
+    use flatmap_rs::FlatMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::thread;

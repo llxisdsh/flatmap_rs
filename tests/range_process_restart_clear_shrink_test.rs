@@ -1,4 +1,4 @@
-use flatmapof::{FlatMap, Op};
+use flatmap_rs::{FlatMap, Op};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Barrier,
