@@ -1114,7 +1114,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
                     let key = unsafe { entry.key.assume_init_ref().clone() };
                     let val = unsafe { entry.val.assume_init_ref().clone() };
-                    let (hash64, h2) = self.hash_pair(&key);
+                    //let (hash64, h2) = self.hash_pair(&key);
+                    let hash64 = entry.hash;
+                    let h2 = self.h2(hash64);
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask);
@@ -1198,7 +1200,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
                     let key = unsafe { entry.key.assume_init_ref().clone() };
                     let val = unsafe { entry.val.assume_init_ref().clone() };
-                    let (hash64, h2) = self.hash_pair(&key);
+                    //let (hash64, h2) = self.hash_pair(&key);
+                    let hash64 = entry.hash;
+                    let h2 = self.h2(hash64);
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask);
