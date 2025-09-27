@@ -1,4 +1,4 @@
-//! FlatMapOf: a high-performance flat hash map using per-bucket seqlock, ported from Go's FlatMapOf.
+//! FlatMapOf: a high-performance flat hash map using per-bucket seqlock, ported from Go's pb.FlatMapOf.
 //! Simplified, Rust-idiomatic API focused on speed.
 
 // use std::hash::BuildHasherDefault;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::thread;
 
 use std::cell::UnsafeCell;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash};
 
 use ahash::RandomState;
 const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
@@ -42,7 +42,6 @@ fn next_pow2(mut n: usize) -> usize {
     n + 1
 }
 
-#[inline]
 fn calc_table_len(size_hint: usize) -> usize {
     let min_cap = (size_hint as f64 * (1.0 / (ENTRIES_PER_BUCKET as f64 * LOAD_FACTOR))) as usize;
     let base = min_cap.max(MIN_TABLE_LEN);
@@ -81,18 +80,18 @@ fn calc_parallelism(
     (max_workers, chunks)
 }
 
-pub struct FlatMap<K, V> {
+pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
     table: AtomicPtr<Table<K, V>>,
     old_tables: std::cell::UnsafeCell<Vec<Box<Table<K, V>>>>,
     resize_state: AtomicPtr<ResizeState<K, V>>,
     shrink_on: bool,
-    hasher: RandomState,
+    hasher: S,
 }
 
 // SAFETY: FlatMap coordinates concurrent access via per-bucket seqlocks, a root bucket op lock, and a resize_lock guarding table swaps.
 // The UnsafeCell around the Arc<Table> is only mutated under resize_lock and never moved; readers clone the Arc which is safe.
-unsafe impl<K: Send, V: Send> Send for FlatMap<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for FlatMap<K, V> {}
+unsafe impl<K: Send, V: Send, S: Send + BuildHasher> Send for FlatMap<K, V, S> {}
+unsafe impl<K: Sync, V: Sync, S: Sync + BuildHasher> Sync for FlatMap<K, V, S> {}
 
 struct Table<K, V> {
     buckets: Vec<Bucket<K, V>>,
@@ -173,7 +172,7 @@ impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
     }
 }
 
-impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<K, V> {
+impl<K: Eq + Hash + Clone, V: Clone> FlatMap<K, V, RandomState> {
     /// Create a new FlatMap with default settings.
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -184,31 +183,16 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     /// This pre-allocates internal buckets based on the provided size hint. The map may grow
     /// beyond this capacity as elements are inserted.
     pub fn with_capacity(size_hint: usize) -> Self {
-        let len = calc_table_len(size_hint);
-        let mut buckets = Vec::with_capacity(len);
-        for _ in 0..len {
-            buckets.push(Bucket::new());
-        }
-        let table = Table {
-            buckets,
-            mask: len - 1,
-            counters: std::array::from_fn(|_| AtomicU64::new(0)),
-        };
-        let table_ptr = Box::into_raw(Box::new(table));
-        Self {
-            table: AtomicPtr::new(table_ptr),
-            old_tables: std::cell::UnsafeCell::new(Vec::new()),
-            resize_state: AtomicPtr::new(std::ptr::null_mut()),
-            shrink_on: false,
-            hasher: RandomState::new(),
-        }
+        Self::with_capacity_and_hasher(size_hint, RandomState::new())
     }
+}
 
+impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     /// Create a new FlatMap using the provided hasher.
     ///
     /// This constructor allows customizing the hashing strategy up front. Changing the hasher
     /// on an existing map is not supported because it would invalidate existing bucket placement.
-    pub fn with_hasher(hasher: RandomState) -> Self {
+    pub fn with_hasher(hasher: S) -> Self {
         Self::with_capacity_and_hasher(0, hasher)
     }
 
@@ -216,7 +200,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     ///
     /// Pre-allocates internal buckets based on the size hint and uses the provided hasher for key
     /// hashing. This is the recommended way to set a custom hashing strategy.
-    pub fn with_capacity_and_hasher(size_hint: usize, hasher: RandomState) -> Self {
+    pub fn with_capacity_and_hasher(size_hint: usize, hasher: S) -> Self {
         let len = calc_table_len(size_hint);
         let mut buckets = Vec::with_capacity(len);
         for _ in 0..len {
@@ -279,7 +263,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     where
         V: Clone,
     {
-        let table = self.seq_load_table();
+        let table = self.load_table();
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask);
         let root = &table.buckets[idx];
@@ -468,7 +452,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
-        let table = self.seq_load_table();
+        let table = self.load_table();
         for i in 0..table.buckets.len() {
             let root = &table.buckets[i];
             root.lock();
@@ -567,7 +551,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         let (hash64, h2) = self.hash_pair(&key);
 
         loop {
-            let table = self.seq_load_table();
+            let table = self.load_table();
             let idx = self.h1_mask(hash64, table.mask);
             let root = &table.buckets[idx];
 
@@ -586,7 +570,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             }
 
             // Check if table was swapped during lock acquisition
-            let current_table = self.seq_load_table();
+            let current_table = self.load_table();
             if !std::ptr::eq(table, current_table) {
                 root.unlock();
                 continue; // Retry with new table
@@ -771,7 +755,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         V: Clone,
     {
         'restart: loop {
-            let table = self.seq_load_table();
+            let table = self.load_table();
 
             for i in 0..table.buckets.len() {
                 let root = &table.buckets[i];
@@ -790,7 +774,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 }
 
                 // Check if table has been swapped during resize
-                let current_table = self.seq_load_table();
+                let current_table = self.load_table();
                 if !std::ptr::eq(table, current_table) {
                     root.unlock();
                     continue 'restart; // Retry with new table
@@ -869,7 +853,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     }
 
     pub fn len(&self) -> usize {
-        let table = self.seq_load_table();
+        let table = self.load_table();
         self.sum_counters(table)
     }
     pub fn is_empty(&self) -> bool {
@@ -880,15 +864,9 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         self.try_resize(ResizeHint::Clear);
     }
 
-    fn seq_load_table(&self) -> &Table<K, V> {
-        loop {
-            let table_ptr = self.table.load(Ordering::Acquire);
-            if table_ptr.is_null() {
-                std::thread::yield_now();
-                continue;
-            }
-            return unsafe { &*table_ptr };
-        }
+    #[inline]
+    fn load_table(&self) -> &Table<K, V> {
+        return unsafe { &*self.table.load(Ordering::Acquire) };
     }
 
     #[inline]
@@ -904,11 +882,13 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     fn h1_mask(&self, hash64: u64, mask: usize) -> usize {
         ((hash64 >> 7) as usize) & mask
     }
+
     #[inline]
     fn h2(&self, hash64: u64) -> u8 {
         (hash64 as u8) | (SLOT_MASK as u8)
     }
 
+    #[inline]
     fn sum_counters(&self, table: &Table<K, V>) -> usize {
         let mut s = 0usize;
         for i in 0..NUM_STRIPES {
@@ -918,6 +898,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         s
     }
 
+    #[inline]
     fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
         let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
         let total = self.sum_counters(table);
@@ -927,6 +908,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         }
     }
 
+    #[inline]
     fn maybe_resize_after_remove(&self, table: &Table<K, V>) {
         if !self.shrink_on {
             return;
@@ -946,7 +928,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         }
 
         // Try to start a new resize - only create ResizeState, not the new table yet
-        let old_table = self.seq_load_table();
+        let old_table = self.load_table();
         let old_len = old_table.mask + 1;
 
         if hint == ResizeHint::Shrink {
@@ -999,7 +981,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
 
     unsafe fn help_copy_and_wait(&self, state: &ResizeState<K, V>) {
         // This method corresponds to Go's helpCopyAndWait function
-        let old_table = self.seq_load_table();
+        let old_table = self.load_table();
         let table_len = old_table.mask + 1;
 
         // Get new table and chunks from state
@@ -1283,7 +1265,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         // This method corresponds to Go's finalizeResize function
         // It creates the new table and initiates the copy process
 
-        let old_table = self.seq_load_table();
+        let old_table = self.load_table();
         let old_len = old_table.mask + 1;
 
         // Calculate new table length based on resize hint
@@ -1401,27 +1383,34 @@ impl<K, V> Bucket<K, V> {
     }
 }
 
+#[inline]
 fn broadcast(b: u8) -> u64 {
     0x0101_0101_0101_0101u64 * (b as u64)
 }
+
+#[inline]
 fn first_marked_byte_index(w: u64) -> usize {
     (w.trailing_zeros() >> 3) as usize
 }
+
+#[inline]
 fn mark_zero_bytes(w: u64) -> u64 {
     (w.wrapping_sub(0x0101_0101_0101_0101)) & (!w) & META_MASK
 }
+
+#[inline]
 fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
     let shift = (idx as u64) << 3;
     (w & !(0xffu64 << shift)) | ((b as u64) << shift)
 }
 
-// Collect clones via for_each to maintain safe iteration semantics under seqlock
 #[inline]
 fn stripe_index(idx: usize) -> usize {
     idx & (NUM_STRIPES - 1)
 }
-pub fn iter<K: Clone + Eq + std::hash::Hash, V: Clone>(
-    map: &FlatMap<K, V>,
+
+pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
+    map: &FlatMap<K, V, S>,
 ) -> impl Iterator<Item = (K, V)> {
     let mut items: Vec<(K, V)> = Vec::new();
     map.range(|k, v| {
@@ -1446,7 +1435,7 @@ fn try_spin(spins: &mut i32) -> bool {
     }
 }
 
-impl<K, V> Drop for FlatMap<K, V> {
+impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
     fn drop(&mut self) {
         // Clean up current table
         let table_ptr = self.table.load(Ordering::Acquire);
@@ -1506,14 +1495,18 @@ impl<K, V> Entry<K, V> {
 }
 
 // Provide idiomatic trait implementations to integrate with the Rust ecosystem.
-impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> Default for FlatMap<K, V> {
+impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Default for FlatMap<K, V, S> {
     fn default() -> Self {
-        Self::new()
+        Self::with_hasher(S::default())
     }
 }
 
-impl<'a, K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> IntoIterator
-    for &'a FlatMap<K, V>
+impl<
+        'a,
+        K: Eq + std::hash::Hash + std::clone::Clone,
+        V: std::clone::Clone,
+        S: BuildHasher + Default,
+    > IntoIterator for &'a FlatMap<K, V, S>
 {
     type Item = (K, V);
     type IntoIter = std::vec::IntoIter<(K, V)>;
@@ -1523,11 +1516,14 @@ impl<'a, K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> Into
     }
 }
 
-impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone>
-    std::iter::FromIterator<(K, V)> for FlatMap<K, V>
+impl<
+        K: Eq + std::hash::Hash + std::clone::Clone,
+        V: std::clone::Clone,
+        S: BuildHasher + Default,
+    > std::iter::FromIterator<(K, V)> for FlatMap<K, V, S>
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        let map = FlatMap::new();
+        let map = FlatMap::with_hasher(S::default());
         for (k, v) in iter {
             let _ = map.insert(k, v);
         }
@@ -1535,8 +1531,11 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone>
     }
 }
 
-impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> std::iter::Extend<(K, V)>
-    for FlatMap<K, V>
+impl<
+        K: Eq + std::hash::Hash + std::clone::Clone,
+        V: std::clone::Clone,
+        S: BuildHasher + Default,
+    > std::iter::Extend<(K, V)> for FlatMap<K, V, S>
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         for (k, v) in iter {
