@@ -13,7 +13,7 @@ use ahash::AHasher;
 const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
 const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
-const SLOT_MASK: u8 = 0x80; // mark bit in meta byte
+const SLOT_MASK: u64 = 0x80; // mark bit in meta byte
 const LOAD_FACTOR: f64 = 0.75;
 const SHRINK_FRACTION: usize = 8;
 const MIN_TABLE_LEN: usize = 32;
@@ -235,8 +235,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     where
         V: Clone,
     {
-        let table_arc = self.seq_load_table();
-        let table = &*table_arc;
+        let table = self.seq_load_table();
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask);
         let root = &table.buckets[idx];
@@ -245,7 +244,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         // Traverse bucket chain (like Go version)
         let mut bucket_ptr = root as *const Bucket<K, V>;
         let mut need_fallback = false;
-        
+
         while !bucket_ptr.is_null() && !need_fallback {
             let b = unsafe { &*bucket_ptr };
             let mut spins = 0;
@@ -271,16 +270,13 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     let entries_ref = unsafe { &*b.entries.get() };
                     let e = &entries_ref[j];
 
-                    // Copy entry data atomically (like Go: e := *b.At(j))
-                    let entry_hash = e.hash;
-                    let entry_occupied = e.is_occupied();
-
-                    // Skip empty entries early
-                    if !entry_occupied {
+                    // Copy only hash first to filter out mismatches without cloning key/val
+                    if !e.is_occupied() || !e.equal_hash(hash64) {
                         marked &= marked - 1;
                         continue;
                     }
 
+                    // For potential matches, copy key and val before seqlock check
                     let (entry_key, entry_val) = unsafe {
                         (
                             e.key.assume_init_ref().clone(),
@@ -300,7 +296,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     }
 
                     // Validate the copied entry
-                    if entry_hash == hash64 && entry_key == *key {
+                    if entry_key == *key {
                         return Some(entry_val);
                     }
 
@@ -327,7 +323,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     let entries_ref = unsafe { &*bb.entries.get() };
                     let e = &entries_ref[j];
 
-                    if e.is_occupied() && e.equal_hash(hash64) {
+                    if e.equal_hash(hash64) {
                         unsafe {
                             if e.key.assume_init_ref() == key {
                                 let result = e.val.assume_init_ref().clone();
@@ -428,8 +424,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     pub fn for_each<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
-        let table_arc = self.seq_load_table();
-        let table = &*table_arc;
+        let table = self.seq_load_table();
         for i in 0..table.buckets.len() {
             let root = &table.buckets[i];
             root.lock();
@@ -442,8 +437,8 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 while marked != 0 {
                     let j = first_marked_byte_index(marked);
                     let e = &entries_ref[j];
-                    // Only access key/value if slot is marked as occupied in meta and entry is occupied
-                    if (meta >> (j * 8)) & 0x80 != 0 && e.is_occupied() {
+                    // Only access key/value if slot is marked as occupied in meta
+                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
                         let k = unsafe { e.key.assume_init_ref().clone() };
                         let v = unsafe { e.val.assume_init_ref().clone() };
                         items.push((k, v));
@@ -545,7 +540,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     }
 
                     let entry = &entries[slot];
-                    if entry.is_occupied() && entry.equal_hash(hash64) {
+                    if entry.equal_hash(hash64) {
                         let entry_key = unsafe { entry.key.assume_init_ref() };
                         if entry_key == &key {
                             found_info = Some((b as *const _ as *mut _, slot));
@@ -617,7 +612,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
 
                         root.unlock();
                         // Update counter
-                        let stripe = hash64 as usize % NUM_STRIPES;
+                        let stripe = stripe_index(idx);
                         table.counters[stripe].fetch_sub(1, Ordering::Relaxed);
                         self.maybe_resize_after_remove(table);
                         return (Some(old_val), None);
@@ -657,7 +652,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = hash64 as usize % NUM_STRIPES;
+                                let stripe = stripe_index(idx);
                                 table.counters[stripe].fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
@@ -680,7 +675,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = hash64 as usize % NUM_STRIPES;
+                                let stripe = stripe_index(idx);
                                 table.counters[stripe].fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
@@ -771,7 +766,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                     b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
                                     b.meta.store(meta, Ordering::Release);
                                     b.seq.store(seq + 2, Ordering::Release); // End write (make even)
-                                    
+
                                     // Clear the entry AFTER seqlock protection (like process method)
                                     entry.clear();
                                     unsafe {
@@ -780,7 +775,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                     }
 
                                     // Decrement counter using bucket index like Go version
-                                    let stripe_idx = i & (NUM_STRIPES - 1);
+                                    let stripe_idx = stripe_index(i);
                                     table.counters[stripe_idx].fetch_sub(1, Ordering::Relaxed);
                                 }
                             }
@@ -804,8 +799,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     }
 
     pub fn len(&self) -> usize {
-        let table_arc = self.seq_load_table();
-        let table = &*table_arc;
+        let table = self.seq_load_table();
         self.sum_counters(table)
     }
     pub fn is_empty(&self) -> bool {
@@ -842,7 +836,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     }
     #[inline]
     fn h2(&self, hash64: u64) -> u8 {
-        (hash64 as u8) | SLOT_MASK
+        (hash64 as u8) | (SLOT_MASK as u8)
     }
 
     fn sum_counters(&self, table: &Table<K, V>) -> usize {
@@ -996,7 +990,9 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 (&mut *self.old_tables.get()).push(old_table);
 
                 // Clear resize state pointer first
-                let state_ptr = self.resize_state.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                let state_ptr = self
+                    .resize_state
+                    .swap(std::ptr::null_mut(), Ordering::AcqRel);
 
                 // Signal completion (like rs.wg.Done() in Go)
                 state.done.store(true, Ordering::Release);
@@ -1039,7 +1035,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         }
         // Update counters in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
-            let stripe = stripe_index(start as u64);
+            let stripe = stripe_index(start);
             new_table.counters[stripe].fetch_add(total_copied as u64, Ordering::Relaxed);
         }
     }
@@ -1064,7 +1060,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 let entry = &entries_ref[j];
 
                 // Check if slot is marked as occupied and entry is occupied
-                if (meta >> (j * 8)) & 0x80 != 0 && entry.is_occupied() {
+                if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
                     let key = unsafe { entry.key.assume_init_ref().clone() };
                     let val = unsafe { entry.val.assume_init_ref().clone() };
                     let (hash64, h2) = self.hash_pair(&key);
@@ -1148,7 +1144,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 let entry = &entries_ref[j];
 
                 // Check if slot is marked as occupied and entry is occupied
-                if (meta >> (j * 8)) & 0x80 != 0 && entry.is_occupied() {
+                if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
                     let key = unsafe { entry.key.assume_init_ref().clone() };
                     let val = unsafe { entry.val.assume_init_ref().clone() };
                     let (hash64, h2) = self.hash_pair(&key);
@@ -1350,8 +1346,9 @@ fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
 }
 
 // Collect clones via for_each to maintain safe iteration semantics under seqlock
-fn stripe_index(hash64: u64) -> usize {
-    (hash64 as usize) & (NUM_STRIPES - 1)
+#[inline]
+fn stripe_index(idx: usize) -> usize {
+    idx & (NUM_STRIPES - 1)
 }
 pub fn iter<K: Clone + Eq + std::hash::Hash, V: Clone>(
     map: &FlatMap<K, V>,

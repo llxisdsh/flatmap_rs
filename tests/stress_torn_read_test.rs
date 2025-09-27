@@ -1,8 +1,8 @@
 use flatmapof::{FlatMap, Op};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn stress_torn_read_test() {
@@ -39,7 +39,7 @@ fn stress_torn_read_test() {
     let barrier_clone2 = Arc::clone(&barrier);
     let stop_flag_clone2 = Arc::clone(&stop_flag);
     let torn_read_count_clone = Arc::clone(&torn_read_count);
-    let debug_count_clone = Arc::clone(&debug_count);
+    //let debug_count_clone = Arc::clone(&debug_count);
 
     // Reader thread: continuously read values and check for consistency (same as original)
     let reader = thread::spawn(move || {
@@ -47,13 +47,14 @@ fn stress_torn_read_test() {
         while !stop_flag_clone2.load(Ordering::Relaxed) {
             for i in 0..100 {
                 if let Some(value) = map_clone2.get(&i) {
-                    let count = debug_count_clone.fetch_add(1, Ordering::Relaxed);
-                    
+                    //let count = debug_count_clone.fetch_add(1, Ordering::Relaxed);
+
                     // Check if the value is consistent (not a torn read)
                     let value_str = value.as_str();
                     if !value_str.starts_with("value_") && !value_str.starts_with("updated_") {
                         let torn_count = torn_read_count_clone.fetch_add(1, Ordering::Relaxed);
-                        if torn_count < 10 { // Print first few torn reads for debugging
+                        if torn_count < 10 {
+                            // Print first few torn reads for debugging
                             println!("TORN READ: Invalid prefix for key={}, value='{}'", i, value);
                         }
                     }
@@ -87,8 +88,15 @@ fn stress_torn_read_test() {
     reader.join().unwrap();
 
     println!("Total reads: {}", debug_count.load(Ordering::Relaxed));
-    println!("Torn reads detected: {}", torn_read_count.load(Ordering::Relaxed));
-    
+    println!(
+        "Torn reads detected: {}",
+        torn_read_count.load(Ordering::Relaxed)
+    );
+
     // Should have no torn reads
-    assert_eq!(torn_read_count.load(Ordering::Relaxed), 0, "Detected torn reads during concurrent range_process updates");
+    assert_eq!(
+        torn_read_count.load(Ordering::Relaxed),
+        0,
+        "Detected torn reads during concurrent range_process updates"
+    );
 }
