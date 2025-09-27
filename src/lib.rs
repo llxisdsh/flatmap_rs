@@ -174,9 +174,22 @@ impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
 }
 
 impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<K, V> {
+    /// Creates a new FlatMap with default settings.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - A new FlatMap instance.
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
+
+    /// Creates a new FlatMap with the specified capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `size_hint` - A hint about the number of elements the map will store.
+    ///                 This is used to pre-allocate memory for the map,
+    ///                 but the map may grow beyond this size if more elements are inserted.
     pub fn with_capacity(size_hint: usize) -> Self {
         let len = calc_table_len(size_hint);
         let mut buckets = Vec::with_capacity(len);
@@ -197,10 +210,27 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             hasher: BuildHasherDefault::<AHasher>::default(),
         }
     }
+
+    /// Enables or disables shrinking of the map when the number of elements
+    /// decreases below the current capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `enable` - A boolean indicating whether to enable or disable shrinking.
     pub fn enable_shrink(mut self, enable: bool) -> Self {
         self.shrink_on = enable;
         self
     }
+
+    /// Returns a reference to the value associated with the given key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up.
+    ///
+    /// # Returns
+    ///
+    /// * `Option<V>` - The value associated with the key, if it exists.
     pub fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
@@ -212,95 +242,94 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         let root = &table.buckets[idx];
         let h2w = broadcast(hash_u8);
 
-        // Try lockfree read first (like Go version)
-        let mut b = root;
-        loop {
+        // Traverse bucket chain (like Go version)
+        let mut bucket_ptr = root as *const Bucket<K, V>;
+        let mut need_fallback = false;
+        
+        while !bucket_ptr.is_null() && !need_fallback {
+            let b = unsafe { &*bucket_ptr };
             let mut spins = 0;
+
             'retry: loop {
-                let s1 = b.seq.load(Ordering::Acquire);
+                let s1 = b.seq.load(Ordering::SeqCst);
                 if (s1 & 1) != 0 {
                     // writer in progress
                     if try_spin(&mut spins) {
                         continue 'retry;
                     }
-                    // Too many spins, fallback to locked read
+                    // Too many spins, need fallback
+                    need_fallback = true;
                     break 'retry;
                 }
 
-                let meta = b.meta.load(Ordering::Acquire);
+                let meta = b.meta.load(Ordering::SeqCst);
                 let mut marked = mark_zero_bytes(meta ^ h2w);
 
-                // Copy entries while seqlock is stable (like Go version)
+                // Process each marked entry (like Go version)
                 while marked != 0 {
                     let j = first_marked_byte_index(marked);
                     let entries_ref = unsafe { &*b.entries.get() };
                     let e = &entries_ref[j];
 
-                    // Copy entire entry first (like Go: e := *b.At(j))
-                    let copied_entry = Entry {
-                        hash: e.hash,
-                        key: unsafe { std::ptr::read(&e.key) },
-                        val: unsafe { std::ptr::read(&e.val) },
+                    // Copy entry data atomically (like Go: e := *b.At(j))
+                    let entry_hash = e.hash;
+                    let entry_occupied = e.is_occupied();
+
+                    // Skip empty entries early
+                    if !entry_occupied {
+                        marked &= marked - 1;
+                        continue;
+                    }
+
+                    let (entry_key, entry_val) = unsafe {
+                        (
+                            e.key.assume_init_ref().clone(),
+                            e.val.assume_init_ref().clone(),
+                        )
                     };
 
                     // Check seqlock immediately after copying (like Go version)
-                    let s2 = b.seq.load(Ordering::Acquire);
+                    let s2 = b.seq.load(Ordering::SeqCst);
                     if s1 != s2 {
                         if try_spin(&mut spins) {
                             continue 'retry;
                         }
-                        // Too many spins, fallback to locked read
+                        // Too many spins, need fallback
+                        need_fallback = true;
                         break 'retry;
                     }
 
-                    // Now validate the copied entry
-                    if copied_entry.is_occupied() && copied_entry.equal_hash(hash64) {
-                        // SAFETY: entry is occupied and hash matches, so key should be initialized
-                        unsafe {
-                            let copied_key = copied_entry.key.assume_init_ref();
-                            if *copied_key == *key {
-                                // SAFETY: if key is valid, value should also be initialized
-                                let copied_val = copied_entry.val.assume_init_ref().clone();
-                                return Some(copied_val);
-                            }
-                        }
+                    // Validate the copied entry
+                    if entry_hash == hash64 && entry_key == *key {
+                        return Some(entry_val);
                     }
 
                     marked &= marked - 1;
                 }
 
-                // No match found in this bucket, move to next
-                let next_ptr = b.next.load(Ordering::Acquire);
-                if !next_ptr.is_null() {
-                    b = unsafe { &*next_ptr };
-                    continue 'retry;
-                } else {
-                    // End of chain, not found
-                    return None;
-                }
+                // Successfully processed this bucket, move to next
+                bucket_ptr = b.next.load(Ordering::Acquire);
+                break 'retry;
             }
+        }
 
-            // Fallback: locked read under root bucket lock for consistency
+        // Fallback: locked read (like Go version)
+        if need_fallback {
             root.lock();
-            let mut bb = root;
-            loop {
+            bucket_ptr = root as *const Bucket<K, V>;
+            while !bucket_ptr.is_null() {
+                let bb = unsafe { &*bucket_ptr };
                 let meta_locked = bb.meta.load(Ordering::Relaxed);
                 let mut marked_locked = mark_zero_bytes(meta_locked ^ h2w);
-                let entries_ref_locked = unsafe { &*bb.entries.get() };
+
                 while marked_locked != 0 {
                     let j = first_marked_byte_index(marked_locked);
-                    let e = &entries_ref_locked[j];
+                    let entries_ref = unsafe { &*bb.entries.get() };
+                    let e = &entries_ref[j];
 
-                    // Check if this slot is actually occupied by checking meta byte and hash match
-                    let slot_meta = (meta_locked >> (j * 8)) & 0xFF;
-                    if slot_meta & (SLOT_MASK as u64) != 0
-                        && e.is_occupied()
-                        && e.equal_hash(hash64)
-                    {
-                        // SAFETY: Under lock, slot is marked as occupied, and hash matches
+                    if e.is_occupied() && e.equal_hash(hash64) {
                         unsafe {
-                            let key_ref = e.key.assume_init_ref();
-                            if *key_ref == *key {
+                            if e.key.assume_init_ref() == key {
                                 let result = e.val.assume_init_ref().clone();
                                 root.unlock();
                                 return Some(result);
@@ -309,29 +338,54 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     }
                     marked_locked &= marked_locked - 1;
                 }
-                let next_ptr_locked = bb.next.load(Ordering::Acquire);
-                if !next_ptr_locked.is_null() {
-                    bb = unsafe { &*next_ptr_locked };
-                } else {
-                    break;
-                }
+                bucket_ptr = bb.next.load(Ordering::Acquire);
             }
             root.unlock();
-            return None;
         }
+
+        None
     }
+
+    /// Inserts a key-value pair into the map.
+    /// If the key already exists, the old value is replaced with the new value.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert.
+    /// * `val` - The value to insert.
     pub fn insert(&self, key: K, val: V) -> Option<V>
     where
         V: Clone,
     {
         self.process(key, |_| (Op::Update, Some(val.clone()))).0
     }
+
+    /// Removes the key-value pair associated with the given key from the map.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to remove.
+    ///
+    /// # Returns
+    ///
+    /// * `Option<V>` - The value associated with the key, if it existed.
     pub fn remove(&self, key: K) -> Option<V>
     where
         V: Clone,
     {
         self.process(key, |_| (Op::Delete, None)).0
     }
+
+    /// Returns the value associated with the given key, or inserts a new value if the key does not exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up.
+    /// * `f` - A closure that takes no arguments and returns the value to insert if the key does not exist.
+    ///
+    /// # Returns
+    ///
+    /// * `(V, bool)` - A tuple containing the value associated with the key, and a boolean indicating whether the value was inserted.
     pub fn get_or_insert_with<F: FnOnce() -> V>(&self, key: K, f: F) -> (V, bool)
     where
         V: Clone,
@@ -361,8 +415,19 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             unreachable!("get_or_insert_with should always return a value")
         }
     }
+
+    /// Applies the given closure to each key-value pair in the map.
+    /// If the closure returns false for any pair, the iteration is stopped.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - A closure that takes a reference to a key and a reference to a value,
+    ///         and returns a boolean. The closure will be called for each key-value pair
+    ///         in the map. If the closure returns false for any pair, the iteration will
+    ///         be stopped.
     pub fn for_each<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
-        // 在根桶锁下收集克隆，避免并发撕裂，然后在解锁后回调用户闭包
+        // In root bucket lock, collect clones to avoid concurrent
+        // tearing, then callback user closure after unlock
         let table_arc = self.seq_load_table();
         let table = &*table_arc;
         for i in 0..table.buckets.len() {
@@ -400,7 +465,10 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             }
         }
     }
-    // Rust风格迭代器（基于收集，简单安全）
+
+    /// Returns an iterator over the key-value pairs in the map.
+    /// The iterator is a clone of the map's contents, so it does not reflect any changes
+    /// made to the map after the iterator is created.
     pub fn iter(&self) -> impl Iterator<Item = (K, V)>
     where
         K: Clone,
@@ -417,6 +485,15 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     /// Process applies a compute-style update to a specific key.
     /// The function `f` receives the current value (if any) and returns an Op and new value.
     /// Returns (old_value, new_value) where old_value is the previous value if any.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to process.
+    /// * `f` - A closure that takes an `Option<V>` and returns a tuple of `(Op, Option<V>)`.
+    ///
+    /// # Returns
+    ///
+    /// * `(Option<V>, Option<V>)` - A tuple containing the old value (if any) and the new value (if any).
     pub fn process<F>(&self, key: K, mut f: F) -> (Option<V>, Option<V>)
     where
         F: FnMut(Option<V>) -> (Op, Option<V>),
@@ -447,17 +524,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             let current_table = self.seq_load_table();
             if !std::ptr::eq(table, current_table) {
                 root.unlock();
-
-                // 不需要
-                // // Check if resize is in progress and help complete it
-                // let resize_state_ptr = self.resize_state.load(Ordering::Acquire);
-                // if !resize_state_ptr.is_null() {
-                //     let resize_state = unsafe { &*resize_state_ptr };
-                //     let new_table_ptr = resize_state.new_table.load(Ordering::Acquire);
-                //     if !new_table_ptr.is_null() {
-                //         unsafe { self.help_copy_and_wait(resize_state) };
-                //     }
-                // }
                 continue; // Retry with new table
             }
 
@@ -533,17 +599,22 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                         }
                     }
                     Op::Delete => {
-                        // Clear the entry
+                        // Use seqlock to protect the delete operation (like Go version)
+                        // Precompute new meta and minimize odd window
+                        let meta = bucket.meta.load(Ordering::Acquire);
+                        let new_meta = set_byte(meta, EMPTY_SLOT, slot);
+                        let seq = bucket.seq.load(Ordering::Relaxed);
+                        bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                        bucket.meta.store(new_meta, Ordering::Release);
+                        bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
+
+                        // After publishing even seq, clear entry fields before releasing root lock
                         entry.clear();
                         unsafe {
                             std::ptr::drop_in_place(entry.key.as_mut_ptr());
                             std::ptr::drop_in_place(entry.val.as_mut_ptr());
                         }
 
-                        // Update meta to clear the slot - set the meta byte to EMPTY_SLOT (0)
-                        let meta = bucket.meta.load(Ordering::Acquire);
-                        let new_meta = set_byte(meta, EMPTY_SLOT, slot);
-                        bucket.meta.store(new_meta, Ordering::Release);
                         root.unlock();
                         // Update counter
                         let stripe = hash64 as usize % NUM_STRIPES;
@@ -556,7 +627,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 // Key not found - process new entry
                 let (op, new_val) = f(None);
                 match op {
-                    Op::Cancel => {
+                    Op::Cancel | Op::Delete => {
                         root.unlock();
                         return (None, None);
                     }
@@ -568,18 +639,21 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                 let empty_bucket = unsafe { &*empty_bucket_ptr };
                                 let entries = unsafe { &mut *empty_bucket.entries.get() };
 
-                                // Use seqlock to protect the write operation (like Go)
-                                let seq = empty_bucket.seq.load(Ordering::Relaxed);
-                                empty_bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                                // Prefill entry data before odd to shorten odd window (like Go)
                                 entries[empty_slot].set_hash(hash64);
                                 entries[empty_slot].key = MaybeUninit::new(key);
                                 entries[empty_slot].val = MaybeUninit::new(new_v.clone());
-                                empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
-
-                                // Update meta to mark slot as occupied
                                 let meta = empty_bucket.meta.load(Ordering::Acquire);
                                 let new_meta = set_byte(meta, h2, empty_slot);
+
+                                // Use seqlock to protect the meta update (like Go)
+                                let seq = empty_bucket.seq.load(Ordering::Relaxed);
+                                empty_bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                                                                                    // Publish meta while still holding the root lock to ensure
+                                                                                    // no other writer starts while this bucket is in odd state
                                 empty_bucket.meta.store(new_meta, Ordering::Release);
+                                // Complete seqlock write (make it even) before releasing root lock
+                                empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
                                 root.unlock();
 
                                 // Update counter
@@ -617,11 +691,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                             return (None, None);
                         }
                     }
-                    Op::Delete => {
-                        // Nothing to delete
-                        root.unlock();
-                        return (None, None);
-                    }
                 }
             }
         }
@@ -630,60 +699,95 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     /// RangeProcess iterates through all entries in the map and applies the function `f` to each.
     /// The function can return Op to modify or delete entries.
     /// This method blocks all other operations on the map during execution.
+    /// Uses meta-based iteration like Go version and processes entries in-lock.
     pub fn range_process<F>(&self, mut f: F)
     where
         F: FnMut(&K, &V) -> (Op, Option<V>),
         V: Clone,
     {
-        loop {
+        'restart: loop {
             let table = self.seq_load_table();
-            let mut to_delete = Vec::new();
-            let mut to_update = Vec::new();
-            let mut table_swapped = false;
 
             for i in 0..table.buckets.len() {
                 let root = &table.buckets[i];
                 root.lock();
 
-                // Check if table was swapped during lock acquisition
+                // Check if resize is in progress and help complete the copy
+                let resize_state_ptr = self.resize_state.load(Ordering::Acquire);
+                if !resize_state_ptr.is_null() {
+                    let resize_state = unsafe { &*resize_state_ptr };
+                    let new_table_ptr = resize_state.new_table.load(Ordering::Acquire);
+                    if !new_table_ptr.is_null() {
+                        root.unlock();
+                        unsafe { self.help_copy_and_wait(resize_state) };
+                        continue 'restart; // Retry with new table
+                    }
+                }
+
+                // Check if table has been swapped during resize
                 let current_table = self.seq_load_table();
                 if !std::ptr::eq(table, current_table) {
                     root.unlock();
-                    table_swapped = true;
-                    break; // Retry with new table
+                    continue 'restart; // Retry with new table
                 }
 
                 let mut b = root;
                 loop {
-                    let entries = unsafe { &*b.entries.get() };
-                    let meta = b.meta.load(Ordering::Acquire);
+                    let entries = unsafe { &mut *b.entries.get() };
+                    let mut meta = b.meta.load(Ordering::Acquire);
 
-                    // Iterate through all slots to find occupied ones
-                    for slot in 0..ENTRIES_PER_BUCKET {
-                        let slot_meta = (meta >> (slot * 8)) & 0xFF;
-                        if slot_meta & (SLOT_MASK as u64) != 0 {
-                            let entry = &entries[slot];
-                            // Double-check with hash field for safety
-                            if entry.is_occupied() {
-                                let key = unsafe { entry.key.assume_init_ref() };
-                                let val = unsafe { entry.val.assume_init_ref() };
-                                let (op, new_val) = f(key, val);
+                    // Use meta-based iteration like Go version: for marked := meta & META_MASK; marked != 0; marked &= marked - 1
+                    let mut marked = meta & META_MASK;
+                    while marked != 0 {
+                        let j = first_marked_byte_index(marked);
+                        let entry = &mut entries[j];
 
-                                match op {
-                                    Op::Cancel => {
-                                        // Continue to next entry
-                                    }
-                                    Op::Update => {
-                                        if let Some(new_v) = new_val {
-                                            to_update.push((key.clone(), new_v));
+                        if entry.is_occupied() {
+                            let key = unsafe { entry.key.assume_init_ref() };
+                            let val = unsafe { entry.val.assume_init_ref() };
+                            let (op, new_val) = f(key, val);
+
+                            match op {
+                                Op::Cancel => {
+                                    // No-op
+                                }
+                                Op::Update => {
+                                    if let Some(new_v) = new_val {
+                                        // Use seqlock to protect the write operation (like process method)
+                                        let seq = b.seq.load(Ordering::Relaxed);
+                                        b.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                                        unsafe {
+                                            std::ptr::drop_in_place(entry.val.as_mut_ptr());
+                                            entry.val.write(new_v);
                                         }
+                                        b.seq.store(seq + 2, Ordering::Release);
+                                        // End write (make even)
                                     }
-                                    Op::Delete => {
-                                        to_delete.push(key.clone());
+                                }
+                                Op::Delete => {
+                                    // Keep snapshot fresh to prevent stale meta
+                                    meta = set_byte(meta, EMPTY_SLOT, j);
+                                    let seq = b.seq.load(Ordering::SeqCst);
+                                    b.seq.store(seq + 1, Ordering::SeqCst); // Start write (make odd)
+                                    b.meta.store(meta, Ordering::SeqCst);
+                                    b.seq.store(seq + 2, Ordering::SeqCst); // End write (make even)
+                                    
+                                    // Clear the entry AFTER seqlock protection (like process method)
+                                    entry.clear();
+                                    unsafe {
+                                        std::ptr::drop_in_place(entry.key.as_mut_ptr());
+                                        std::ptr::drop_in_place(entry.val.as_mut_ptr());
                                     }
+
+                                    // Decrement counter using bucket index like Go version
+                                    let stripe_idx = i & (NUM_STRIPES - 1);
+                                    table.counters[stripe_idx].fetch_sub(1, Ordering::Relaxed);
                                 }
                             }
                         }
+
+                        // Clear the lowest set bit: marked &= marked - 1
+                        marked &= marked.wrapping_sub(1);
                     }
 
                     let next_ptr = b.next.load(Ordering::Acquire);
@@ -694,18 +798,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     }
                 }
                 root.unlock();
-            }
-
-            if table_swapped {
-                continue; // Retry with new table
-            }
-
-            // Apply updates and deletes
-            for key in to_delete {
-                self.remove(key);
-            }
-            for (key, val) in to_update {
-                self.insert(key, val);
             }
             break; // Successfully completed
         }
@@ -786,11 +878,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         // Check if resize is already in progress
         let current_state = self.resize_state.load(Ordering::Acquire);
         if !current_state.is_null() {
-            // 不需要
-            // Help with ongoing resize
-            // unsafe {
-            //     self.help_copy_and_wait(&*current_state);
-            // }
             return;
         }
 
@@ -842,13 +929,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 unsafe {
                     let _ = Box::from_raw(resize_state_ptr);
                 }
-                // 不需要
-                // let current_state = self.resize_state.load(Ordering::Acquire);
-                // if !current_state.is_null() {
-                //     unsafe {
-                //         self.help_copy_and_wait(&*current_state);
-                //     }
-                // }
             }
         }
     }
@@ -869,16 +949,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         }
 
         let new_table = &*new_table_ptr;
-        //let chunks = state.chunks.load(Ordering::Acquire);
-        // 等待 finalize_resize 设置 chunks，避免为 0 导致溢出
-        // while chunks == 0 {
-        //     std::thread::yield_now();
-        //     // 重新加载
-        //     let c = state.chunks.load(Ordering::Acquire);
-        //     if c > 0 {
-        //         break;
-        //     }
-        // }
         let chunks = state.chunks.load(Ordering::Acquire);
 
         // Calculate chunk size
@@ -887,7 +957,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
 
         // Work loop - similar to Go's for loop
         loop {
-            // fetch_add 返回旧值，需要 +1 才是当前处理编号
+            // fetch_add returns the previous value, so we need to add 1 to get the current process number
             let process_prev = state.process.fetch_add(1, Ordering::AcqRel);
             let process_inc = process_prev + 1;
             if process_inc > chunks {
@@ -925,12 +995,16 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                 let old_table = Box::from_raw(old_table_ptr);
                 (&mut *self.old_tables.get()).push(old_table);
 
-                // Clear resize state
-                self.resize_state
-                    .store(std::ptr::null_mut(), Ordering::Release);
+                // Clear resize state pointer first
+                let state_ptr = self.resize_state.swap(std::ptr::null_mut(), Ordering::AcqRel);
 
                 // Signal completion (like rs.wg.Done() in Go)
                 state.done.store(true, Ordering::Release);
+
+                // Clean up the resize state
+                if !state_ptr.is_null() {
+                    let _ = Box::from_raw(state_ptr);
+                }
                 return;
             }
         }
@@ -1139,8 +1213,6 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         copied
     }
 
-    // Reinsertion helper for shrink operations: assumes destination bucket is already locked
-
     unsafe fn finalize_resize(&self, state: &ResizeState<K, V>) {
         // This method corresponds to Go's finalizeResize function
         // It creates the new table and initiates the copy process
@@ -1181,7 +1253,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         if state.hint == ResizeHint::Clear {
             // Swap to new empty table
             let old_table_ptr = self.table.swap(Box::into_raw(new_table), Ordering::AcqRel);
-            
+
             // Add old table to cleanup list
             unsafe {
                 let old_tables = &mut *self.old_tables.get();
@@ -1195,20 +1267,18 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             return;
         }
 
-        // Store the new table in the resize state
-        // 先发布 chunks，再发布 new_table，避免并发读取到 new_table 非空但 chunks 仍为 0
+        // Store chunks and new table in the resize state
         state.chunks.store(chunks as i32, Ordering::Release);
         state
             .new_table
             .store(Box::into_raw(new_table), Ordering::Release);
-        state.chunks.store(chunks as i32, Ordering::Release);
 
         // Now call help_copy_and_wait to perform the actual data copying
         // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
         self.help_copy_and_wait(state);
 
-        // Clean up resize state (help_copy_and_wait handles table swap and resize_state cleanup)
-        let _ = Box::from_raw(state as *const _ as *mut ResizeState<K, V>);
+        // Note: help_copy_and_wait handles table swap and resize_state cleanup
+        // The resize state will be cleaned up by the thread that completes the last chunk
     }
 }
 
