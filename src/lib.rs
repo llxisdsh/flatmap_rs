@@ -251,7 +251,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             let mut spins = 0;
 
             'retry: loop {
-                let s1 = b.seq.load(Ordering::SeqCst);
+                let s1 = b.seq.load(Ordering::Acquire);
                 if (s1 & 1) != 0 {
                     // writer in progress
                     if try_spin(&mut spins) {
@@ -262,7 +262,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     break 'retry;
                 }
 
-                let meta = b.meta.load(Ordering::SeqCst);
+                let meta = b.meta.load(Ordering::Acquire);
                 let mut marked = mark_zero_bytes(meta ^ h2w);
 
                 // Process each marked entry (like Go version)
@@ -289,7 +289,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                     };
 
                     // Check seqlock immediately after copying (like Go version)
-                    let s2 = b.seq.load(Ordering::SeqCst);
+                    let s2 = b.seq.load(Ordering::Acquire);
                     if s1 != s2 {
                         if try_spin(&mut spins) {
                             continue 'retry;
@@ -767,10 +767,10 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                 Op::Delete => {
                                     // Keep snapshot fresh to prevent stale meta
                                     meta = set_byte(meta, EMPTY_SLOT, j);
-                                    let seq = b.seq.load(Ordering::SeqCst);
-                                    b.seq.store(seq + 1, Ordering::SeqCst); // Start write (make odd)
-                                    b.meta.store(meta, Ordering::SeqCst);
-                                    b.seq.store(seq + 2, Ordering::SeqCst); // End write (make even)
+                                    let seq = b.seq.load(Ordering::Relaxed);
+                                    b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                                    b.meta.store(meta, Ordering::Release);
+                                    b.seq.store(seq + 2, Ordering::Release); // End write (make even)
                                     
                                     // Clear the entry AFTER seqlock protection (like process method)
                                     entry.clear();
