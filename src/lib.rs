@@ -763,7 +763,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
                                     // Keep snapshot fresh to prevent stale meta
                                     meta = set_byte(meta, EMPTY_SLOT, j);
                                     let seq = b.seq.load(Ordering::Relaxed);
-                                    b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                                    b.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
                                     b.meta.store(meta, Ordering::Release);
                                     b.seq.store(seq + 2, Ordering::Release); // End write (make even)
 
