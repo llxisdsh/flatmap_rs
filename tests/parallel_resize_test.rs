@@ -21,7 +21,7 @@ fn test_parallel_resize_grow() {
 
 #[test]
 fn test_parallel_resize_shrink() {
-    let map = Arc::new(FlatMap::new().enable_shrink(true));
+    let map = Arc::new(FlatMap::new().set_shrink(true));
 
     // Insert many items to grow the table
     for i in 0..2000 {
@@ -99,7 +99,7 @@ fn test_concurrent_resize() {
 
 #[test]
 fn test_resize_during_operations() {
-    let map = Arc::new(FlatMap::new().enable_shrink(true));
+    let map = Arc::new(FlatMap::new().set_shrink(true));
     let mut handles = vec![];
 
     // Thread 1: Insert items

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn range_process_under_heavy_concurrency_and_resize() {
-    let map = Arc::new(FlatMap::new().enable_shrink(true));
+    let map = Arc::new(FlatMap::new().set_shrink(true));
 
     // Preload some data across buckets
     for i in 0..500 {

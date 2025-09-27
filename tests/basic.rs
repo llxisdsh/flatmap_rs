@@ -55,7 +55,7 @@ fn test_for_each_traversal() {
 
     let mut sum_keys = 0u64;
     let mut sum_vals = 0u64;
-    m.for_each(|k, v| {
+    m.range(|k, v| {
         sum_keys += *k;
         sum_vals += *v;
         true
@@ -90,7 +90,9 @@ fn test_edge_cases_strings() {
 
     // Very long key
     let mut long_key = String::with_capacity(1000);
-    for _ in 0..1000 { long_key.push('a'); }
+    for _ in 0..1000 {
+        long_key.push('a');
+    }
     let (v2, existed2) = m.get_or_insert_with(long_key.clone(), || "long_key_value".to_string());
     assert_eq!(v2, "long_key_value");
     assert!(!existed2);
@@ -117,7 +119,9 @@ fn test_multiple_keys_and_deletions() {
     }
 
     // Delete even keys
-    for i in (0..100).step_by(2) { let _ = m.remove(i); }
+    for i in (0..100).step_by(2) {
+        let _ = m.remove(i);
+    }
 
     // Verify deletions and remaining keys
     for i in 0..100 {
@@ -158,10 +162,12 @@ fn test_size_and_is_empty_semantics() {
 fn test_for_each_early_termination() {
     use flatmapof::FlatMap;
     let m: FlatMap<i32, i32> = FlatMap::new();
-    for i in 0..20 { let _ = m.insert(i, i * 3); }
+    for i in 0..20 {
+        let _ = m.insert(i, i * 3);
+    }
 
     let mut count = 0;
-    m.for_each(|_k, _v| {
+    m.range(|_k, _v| {
         count += 1;
         count < 5 // stop after 5
     });
@@ -172,7 +178,9 @@ fn test_for_each_early_termination() {
 fn test_iter_consistency() {
     use flatmapof::FlatMap;
     let m: FlatMap<i32, String> = FlatMap::new();
-    for i in 0..10 { let _ = m.insert(i, format!("v{}", i)); }
+    for i in 0..10 {
+        let _ = m.insert(i, format!("v{}", i));
+    }
 
     let mut collected = m.iter().collect::<Vec<(i32, String)>>();
     collected.sort_by_key(|(k, _)| *k);

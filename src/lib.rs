@@ -1,7 +1,7 @@
 //! FlatMapOf: a high-performance flat hash map using per-bucket seqlock, ported from Go's FlatMapOf.
 //! Simplified, Rust-idiomatic API focused on speed.
 
-use std::hash::BuildHasherDefault;
+// use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::thread;
@@ -9,7 +9,7 @@ use std::thread;
 use std::cell::UnsafeCell;
 use std::hash::BuildHasher;
 
-use ahash::AHasher;
+use ahash::RandomState;
 const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
 const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
@@ -86,7 +86,7 @@ pub struct FlatMap<K, V> {
     old_tables: std::cell::UnsafeCell<Vec<Box<Table<K, V>>>>,
     resize_state: AtomicPtr<ResizeState<K, V>>,
     shrink_on: bool,
-    hasher: BuildHasherDefault<AHasher>,
+    hasher: RandomState,
 }
 
 // SAFETY: FlatMap coordinates concurrent access via per-bucket seqlocks, a root bucket op lock, and a resize_lock guarding table swaps.
@@ -174,22 +174,15 @@ impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
 }
 
 impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<K, V> {
-    /// Creates a new FlatMap with default settings.
-    ///
-    /// # Returns
-    ///
-    /// * `Self` - A new FlatMap instance.
+    /// Create a new FlatMap with default settings.
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
 
-    /// Creates a new FlatMap with the specified capacity.
+    /// Create a new FlatMap with the specified capacity.
     ///
-    /// # Arguments
-    ///
-    /// * `size_hint` - A hint about the number of elements the map will store.
-    ///                 This is used to pre-allocate memory for the map,
-    ///                 but the map may grow beyond this size if more elements are inserted.
+    /// This pre-allocates internal buckets based on the provided size hint. The map may grow
+    /// beyond this capacity as elements are inserted.
     pub fn with_capacity(size_hint: usize) -> Self {
         let len = calc_table_len(size_hint);
         let mut buckets = Vec::with_capacity(len);
@@ -207,30 +200,81 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
             old_tables: std::cell::UnsafeCell::new(Vec::new()),
             resize_state: AtomicPtr::new(std::ptr::null_mut()),
             shrink_on: false,
-            hasher: BuildHasherDefault::<AHasher>::default(),
+            hasher: RandomState::new(),
         }
     }
 
-    /// Enables or disables shrinking of the map when the number of elements
-    /// decreases below the current capacity.
+    /// Create a new FlatMap using the provided hasher.
     ///
-    /// # Arguments
+    /// This constructor allows customizing the hashing strategy up front. Changing the hasher
+    /// on an existing map is not supported because it would invalidate existing bucket placement.
+    pub fn with_hasher(hasher: RandomState) -> Self {
+        Self::with_capacity_and_hasher(0, hasher)
+    }
+
+    /// Create a new FlatMap with the specified capacity and hasher.
     ///
-    /// * `enable` - A boolean indicating whether to enable or disable shrinking.
-    pub fn enable_shrink(mut self, enable: bool) -> Self {
+    /// Pre-allocates internal buckets based on the size hint and uses the provided hasher for key
+    /// hashing. This is the recommended way to set a custom hashing strategy.
+    pub fn with_capacity_and_hasher(size_hint: usize, hasher: RandomState) -> Self {
+        let len = calc_table_len(size_hint);
+        let mut buckets = Vec::with_capacity(len);
+        for _ in 0..len {
+            buckets.push(Bucket::new());
+        }
+        let table = Table {
+            buckets,
+            mask: len - 1,
+            counters: std::array::from_fn(|_| AtomicU64::new(0)),
+        };
+        let table_ptr = Box::into_raw(Box::new(table));
+        Self {
+            table: AtomicPtr::new(table_ptr),
+            old_tables: std::cell::UnsafeCell::new(Vec::new()),
+            resize_state: AtomicPtr::new(std::ptr::null_mut()),
+            shrink_on: false,
+            hasher,
+        }
+    }
+
+    /// Enable or disable shrinking in-place and return a mutable reference to self.
+    ///
+    /// This method is intended for builder-like ergonomics when configuring the map after
+    /// construction.
+    /// Enable or disable in-place shrinking and return the map by value.
+    ///
+    /// This builder-style method consumes `self` and returns it, making it convenient to chain
+    /// with temporary values like `FlatMap::new().set_shrink(true)`.
+    pub fn set_shrink(mut self, enable: bool) -> Self {
         self.shrink_on = enable;
         self
     }
 
-    /// Returns a reference to the value associated with the given key.
+    /// Enable or disable in-place shrinking in place and return a mutable reference.
     ///
-    /// # Arguments
+    /// This variant does not consume `self` and is useful when you hold the map in a mutable
+    /// binding and want to configure it without moving.
+    pub fn set_shrink_mut(&mut self, enable: bool) -> &mut Self {
+        self.shrink_on = enable;
+        self
+    }
+
+    /// Check whether the given key is present.
     ///
-    /// * `key` - The key to look up.
+    /// This is concurrency-safe. This implementation uses `get` internally and may clone the value
+    /// as part of the lookup.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Get the value associated with the given key as a cloned `V`.
     ///
-    /// # Returns
+    /// Fast path: read under an even seqlock snapshot. On contention, falls back to bucket-level
+    /// lock to guarantee consistency. Requires `V: Clone` to avoid returning an aliased internal
+    /// reference.
+    /// Returns a cloned value corresponding to the key, if present.
     ///
-    /// * `Option<V>` - The value associated with the key, if it exists.
+    /// The internal read path is concurrency-safe and may clone the value before returning it.
     pub fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
@@ -421,7 +465,7 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
     ///         and returns a boolean. The closure will be called for each key-value pair
     ///         in the map. If the closure returns false for any pair, the iteration will
     ///         be stopped.
-    pub fn for_each<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
+    pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
         let table = self.seq_load_table();
@@ -470,11 +514,37 @@ impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> FlatMap<
         V: Clone,
     {
         let mut items: Vec<(K, V)> = Vec::new();
-        self.for_each(|k, v| {
+        self.range(|k, v| {
             items.push((k.clone(), v.clone()));
             true
         });
         items.into_iter()
+    }
+
+    /// Returns an iterator over the cloned keys of the map at the moment of call.
+    pub fn keys(&self) -> impl Iterator<Item = K>
+    where
+        K: Clone,
+    {
+        let mut keys: Vec<K> = Vec::new();
+        self.range(|k, _| {
+            keys.push(k.clone());
+            true
+        });
+        keys.into_iter()
+    }
+
+    /// Returns an iterator over the cloned values of the map at the moment of call.
+    pub fn values(&self) -> impl Iterator<Item = V>
+    where
+        V: Clone,
+    {
+        let mut vals: Vec<V> = Vec::new();
+        self.range(|_, v| {
+            vals.push(v.clone());
+            true
+        });
+        vals.into_iter()
     }
 
     /// Process applies a compute-style update to a specific key.
@@ -1354,7 +1424,7 @@ pub fn iter<K: Clone + Eq + std::hash::Hash, V: Clone>(
     map: &FlatMap<K, V>,
 ) -> impl Iterator<Item = (K, V)> {
     let mut items: Vec<(K, V)> = Vec::new();
-    map.for_each(|k, v| {
+    map.range(|k, v| {
         items.push((k.clone(), v.clone()));
         true
     });
@@ -1432,5 +1502,45 @@ impl<K, V> Entry<K, V> {
     #[inline]
     fn clear(&mut self) {
         self.hash = 0; // Clear all bits including init flag
+    }
+}
+
+// Provide idiomatic trait implementations to integrate with the Rust ecosystem.
+impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> Default for FlatMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> IntoIterator
+    for &'a FlatMap<K, V>
+{
+    type Item = (K, V);
+    type IntoIter = std::vec::IntoIter<(K, V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        // Collect to a Vec to give a concrete iterator type.
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone>
+    std::iter::FromIterator<(K, V)> for FlatMap<K, V>
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let map = FlatMap::new();
+        for (k, v) in iter {
+            let _ = map.insert(k, v);
+        }
+        map
+    }
+}
+
+impl<K: Eq + std::hash::Hash + std::clone::Clone, V: std::clone::Clone> std::iter::Extend<(K, V)>
+    for FlatMap<K, V>
+{
+    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
+        for (k, v) in iter {
+            let _ = self.insert(k, v);
+        }
     }
 }

@@ -9,7 +9,7 @@ fn main() {
     map.insert(3, 30);
 
     println!("Initial map:");
-    map.for_each(|k, v| {
+    map.range(|k, v| {
         println!("  {} -> {}", k, v);
         true // continue iteration
     });
@@ -34,7 +34,7 @@ fn main() {
     println!("\nRangeProcess processed {} entries", count);
 
     println!("\nFinal map:");
-    map.for_each(|k, v| {
+    map.range(|k, v| {
         println!("  {} -> {}", k, v);
         true // continue iteration
     });

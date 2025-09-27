@@ -1,15 +1,20 @@
 use flatmapof::{FlatMap, Op};
-use std::sync::{Arc, Barrier, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Barrier,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
 fn range_process_restart_on_clear_and_shrink() {
     // Enable shrink to test Clear/Shrink interactions
-    let map = Arc::new(FlatMap::new().enable_shrink(true));
+    let map = Arc::new(FlatMap::new().set_shrink(true));
 
     // Preload
-    for i in 0..256 { map.insert(i, i); }
+    for i in 0..256 {
+        map.insert(i, i);
+    }
 
     let start = Arc::new(Barrier::new(3));
     let stop = Arc::new(AtomicBool::new(false));
@@ -24,7 +29,9 @@ fn range_process_restart_on_clear_and_shrink() {
         while Instant::now() < deadline && !st1.load(Ordering::Relaxed) {
             m1.clear();
             // Refill a bit after clear to keep activity
-            for i in 0..64 { m1.insert(i, i * 2); }
+            for i in 0..64 {
+                m1.insert(i, i * 2);
+            }
             thread::sleep(Duration::from_millis(10));
         }
         st1.store(true, Ordering::Relaxed);
