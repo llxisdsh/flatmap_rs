@@ -898,6 +898,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
+        if !self.resize_state.load(Ordering::Acquire).is_null() {
+            return;
+        }
         let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
         let total = self.sum_counters(table);
         let threshold = (cap as f64 * LOAD_FACTOR) as usize;
@@ -909,6 +912,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     #[inline(always)]
     fn maybe_resize_after_remove(&self, table: &Table<K, V>) {
         if !self.shrink_on {
+            return;
+        }
+        if !self.resize_state.load(Ordering::Acquire).is_null() {
             return;
         }
         let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
@@ -1003,8 +1009,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         loop {
             // fetch_add returns the previous value, so we need to add 1 to get the current process number
             let process_prev = state.process.fetch_add(1, Ordering::AcqRel);
-            let process_inc = process_prev + 1;
-            if process_inc > chunks {
+            if process_prev >= chunks {
                 // No more work, wait for completion
                 while !state.done.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -1013,7 +1018,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Convert to 0-based index (Go uses 1-based then decrements)
-            let process0 = process_inc - 1;
+            let process0 = process_prev;
 
             // Calculate chunk boundaries
             let start = process0 as usize * chunk_sz;
