@@ -13,7 +13,7 @@ use ahash::RandomState;
 const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
 const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
-const SLOT_MASK: u64 = 0x80; // mark bit in meta byte
+const SLOT_MASK: u64 = 0x80; // mark a bit in meta byte as slot marker
 const LOAD_FACTOR: f64 = 0.75;
 const SHRINK_FRACTION: usize = 8;
 const MIN_TABLE_LEN: usize = 32;
@@ -82,7 +82,7 @@ fn calc_parallelism(
 
 pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
     table: AtomicPtr<Table<K, V>>,
-    old_tables: std::cell::UnsafeCell<Vec<Box<Table<K, V>>>>,
+    old_tables: UnsafeCell<Vec<Box<Table<K, V>>>>,
     resize_state: AtomicPtr<ResizeState<K, V>>,
     shrink_on: bool,
     hasher: S,
@@ -213,7 +213,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let table_ptr = Box::into_raw(Box::new(table));
         Self {
             table: AtomicPtr::new(table_ptr),
-            old_tables: std::cell::UnsafeCell::new(Vec::new()),
+            old_tables: UnsafeCell::new(Vec::new()),
             resize_state: AtomicPtr::new(std::ptr::null_mut()),
             shrink_on: false,
             hasher,
@@ -619,7 +619,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
             }
 
-            if let Some((bucket_ptr, slot)) = found_info {
+            return if let Some((bucket_ptr, slot)) = found_info {
                 // Key found - process existing entry
                 let bucket = unsafe { &*bucket_ptr };
                 let entries = unsafe { &mut *bucket.entries.get() };
@@ -630,7 +630,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 match op {
                     Op::Cancel => {
                         root.unlock();
-                        return (Some(old_val.clone()), Some(old_val));
+                        (Some(old_val.clone()), Some(old_val))
                     }
                     Op::Update => {
                         if let Some(new_v) = new_val {
@@ -640,10 +640,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                             entry.val = MaybeUninit::new(new_v.clone());
                             bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
                             root.unlock();
-                            return (Some(old_val), Some(new_v));
+                            (Some(old_val), Some(new_v))
                         } else {
                             root.unlock();
-                            return (Some(old_val), None);
+                            (Some(old_val), None)
                         }
                     }
                     Op::Delete => {
@@ -668,7 +668,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         let stripe = stripe_index(idx);
                         table.counters[stripe].fetch_sub(1, Ordering::Relaxed);
                         self.maybe_resize_after_remove(table);
-                        return (Some(old_val), None);
+                        (Some(old_val), None)
                     }
                 }
             } else {
@@ -677,7 +677,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 match op {
                     Op::Cancel | Op::Delete => {
                         root.unlock();
-                        return (None, None);
+                        (None, None)
                     }
                     Op::Update => {
                         if let Some(new_v) = new_val {
@@ -697,8 +697,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 // Use seqlock to protect the meta update (like Go)
                                 let seq = empty_bucket.seq.load(Ordering::Relaxed);
                                 empty_bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
-                                                                                    // Publish meta while still holding the root lock to ensure
-                                                                                    // no other writer starts while this bucket is in odd state
+                                // Publish meta while still holding the root lock to ensure
+                                // no other writer starts while this bucket is in odd state
                                 empty_bucket.meta.store(new_meta, Ordering::Release);
                                 // Complete seqlock write (make it even) before releasing root lock
                                 empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
@@ -709,7 +709,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 table.counters[stripe].fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
-                                return (None, Some(new_v));
+                                (None, Some(new_v))
                             } else {
                                 // Need to create new bucket - find the last bucket in chain
                                 let mut last_bucket = b;
@@ -732,11 +732,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 table.counters[stripe].fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
-                                return (None, Some(new_v));
+                                (None, Some(new_v))
                             }
                         } else {
                             root.unlock();
-                            return (None, None);
+                            (None, None)
                         }
                     }
                 }
@@ -865,7 +865,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline]
     fn load_table(&self) -> &Table<K, V> {
-        return unsafe { &*self.table.load(Ordering::Acquire) };
+        unsafe { &*self.table.load(Ordering::Acquire) }
     }
 
     #[inline]
@@ -988,7 +988,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         if new_table_ptr.is_null() {
             // New table not ready yet, wait for completion
             while !state.done.load(Ordering::Acquire) {
-                std::thread::yield_now();
+                thread::yield_now();
             }
             return;
         }
@@ -1008,7 +1008,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             if process_inc > chunks {
                 // No more work, wait for completion
                 while !state.done.load(Ordering::Acquire) {
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 return;
             }
@@ -1036,7 +1036,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 let new_table_ptr = state.new_table.load(Ordering::Acquire);
                 let old_table_ptr = self.table.swap(new_table_ptr, Ordering::AcqRel);
 
-                // Add old table to cleanup list
+                // Add old table to clean up list
                 let old_table = Box::from_raw(old_table_ptr);
                 (&mut *self.old_tables.get()).push(old_table);
 
@@ -1065,7 +1065,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         total_chunks: usize,
         is_growth: bool,
     ) where
-        K: Clone + Eq + std::hash::Hash,
+        K: Clone + Eq + Hash,
         V: Clone,
     {
         let old_len = old_table.mask + 1;
@@ -1093,7 +1093,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     fn copy_bucket_lock(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
     where
-        K: Clone + Eq + std::hash::Hash,
+        K: Clone + Eq + Hash,
         V: Clone,
     {
         // Lock the source bucket to stabilize the chain
@@ -1179,7 +1179,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     fn copy_bucket(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
     where
-        K: Clone + Eq + std::hash::Hash,
+        K: Clone + Eq + Hash,
         V: Clone,
     {
         // Lock the source bucket to stabilize the chain
@@ -1305,7 +1305,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             // Swap to new empty table
             let old_table_ptr = self.table.swap(Box::into_raw(new_table), Ordering::AcqRel);
 
-            // Add old table to cleanup list
+            // Add old table to clean up list
             unsafe {
                 let old_tables = &mut *self.old_tables.get();
                 old_tables.push(Box::from_raw(old_table_ptr));
@@ -1356,7 +1356,7 @@ impl<K, V> Bucket<K, V> {
 
     #[inline]
     fn lock(&self) {
-        // Root bucket lock using meta's highest byte bit, independent from seq seqlock
+        // Root bucket lock using meta's highest byte bit, independent of seq seqlock
         let mut cur = self.meta.load(Ordering::Acquire);
         loop {
             if (cur & OP_LOCK_MASK) == 0 {
@@ -1431,7 +1431,7 @@ fn try_spin(spins: &mut i32) -> bool {
         true
     } else if *spins < 100 {
         *spins += 1;
-        std::thread::yield_now();
+        thread::yield_now();
         true
     } else {
         false
@@ -1506,8 +1506,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Default for FlatM
 
 impl<
         'a,
-        K: Eq + std::hash::Hash + std::clone::Clone,
-        V: std::clone::Clone,
+        K: Eq + Hash + Clone,
+        V: Clone,
         S: BuildHasher + Default,
     > IntoIterator for &'a FlatMap<K, V, S>
 {
@@ -1520,10 +1520,10 @@ impl<
 }
 
 impl<
-        K: Eq + std::hash::Hash + std::clone::Clone,
-        V: std::clone::Clone,
+        K: Eq + Hash + Clone,
+        V: Clone,
         S: BuildHasher + Default,
-    > std::iter::FromIterator<(K, V)> for FlatMap<K, V, S>
+    > FromIterator<(K, V)> for FlatMap<K, V, S>
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let map = FlatMap::with_hasher(S::default());
@@ -1535,10 +1535,10 @@ impl<
 }
 
 impl<
-        K: Eq + std::hash::Hash + std::clone::Clone,
-        V: std::clone::Clone,
+        K: Eq + Hash + Clone,
+        V: Clone,
         S: BuildHasher + Default,
-    > std::iter::Extend<(K, V)> for FlatMap<K, V, S>
+    > Extend<(K, V)> for FlatMap<K, V, S>
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         for (k, v) in iter {
