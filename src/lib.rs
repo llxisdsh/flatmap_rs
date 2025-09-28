@@ -21,7 +21,6 @@ const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000; // highest meta byte's 0x80 bit
 const NUM_STRIPES: usize = 64;
 
 // Parallel resize constants
-const ASYNC_THRESHOLD: usize = 64; // Minimum table size for async resize
 const MIN_BUCKETS_PER_CPU: usize = 64; // Minimum buckets per CPU thread
 const RESIZE_OVER_PARTITION: usize = 4; // Over-partition factor for resize
 
@@ -60,8 +59,33 @@ struct ResizeState<K, V> {
     chunks: AtomicI32,                 // Set by finalizeResize
     process: AtomicI32,                // Atomic counter for work distribution
     completed: AtomicI32,              // Atomic counter for completed chunks
-    done: AtomicBool,                  // Completion flag (replaces Go's WaitGroup)
-    hint: ResizeHint,                  // Resize operation type
+    started: AtomicBool,               // Whether resize has started
+    hint: UnsafeCell<ResizeHint>,      // Resize operation type (protected by started)
+}
+
+impl<K, V> ResizeState<K, V> {
+    pub fn new() -> Self {
+        Self {
+            new_table: AtomicPtr::new(std::ptr::null_mut()),
+            chunks: AtomicI32::new(0),
+            process: AtomicI32::new(0),
+            completed: AtomicI32::new(0),
+            started: AtomicBool::new(false),
+            hint: UnsafeCell::new(ResizeHint::Grow),
+        }
+    }
+}
+
+impl<K, V> Drop for ResizeState<K, V> {
+    fn drop(&mut self) {
+        // Clean up new table from resize state if it exists
+        let new_table_ptr = self.new_table.load(Ordering::Acquire);
+        if !new_table_ptr.is_null() {
+            unsafe {
+                let _ = Box::from_raw(new_table_ptr);
+            }
+        }
+    }
 }
 
 // Calculate parallelism for resize operations
@@ -82,7 +106,7 @@ fn calc_parallelism(
 pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
     table: AtomicPtr<Table<K, V>>,
     old_tables: UnsafeCell<Vec<Box<Table<K, V>>>>,
-    resize_state: AtomicPtr<ResizeState<K, V>>,
+    resize_state: ResizeState<K, V>,
     shrink_on: bool,
     hasher: S,
 }
@@ -213,7 +237,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         Self {
             table: AtomicPtr::new(table_ptr),
             old_tables: UnsafeCell::new(Vec::new()),
-            resize_state: AtomicPtr::new(std::ptr::null_mut()),
+            resize_state: ResizeState::new(),
             shrink_on: false,
             hasher,
         }
@@ -556,13 +580,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             root.lock();
 
             // Check if resize is in progress before proceeding (like Go version)
-            let resize_state_ptr = self.resize_state.load(Ordering::Acquire);
-            if !resize_state_ptr.is_null() {
-                let resize_state = unsafe { &*resize_state_ptr };
-                let new_table_ptr = resize_state.new_table.load(Ordering::Acquire);
+            if self.resize_state.started.load(Ordering::Acquire) {
+                let new_table_ptr = self.resize_state.new_table.load(Ordering::Acquire);
                 if !new_table_ptr.is_null() {
                     root.unlock();
-                    unsafe { self.help_copy_and_wait(resize_state) };
+                    self.help_copy_and_wait();
                     continue; // Retry with new table
                 }
             }
@@ -760,13 +782,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 root.lock();
 
                 // Check if resize is in progress and help complete the copy
-                let resize_state_ptr = self.resize_state.load(Ordering::Acquire);
-                if !resize_state_ptr.is_null() {
-                    let resize_state = unsafe { &*resize_state_ptr };
-                    let new_table_ptr = resize_state.new_table.load(Ordering::Acquire);
+                if self.resize_state.started.load(Ordering::Acquire) {
+                    let new_table_ptr = self.resize_state.new_table.load(Ordering::Acquire);
                     if !new_table_ptr.is_null() {
                         root.unlock();
-                        unsafe { self.help_copy_and_wait(resize_state) };
+                        self.help_copy_and_wait();
                         continue 'restart; // Retry with new table
                     }
                 }
@@ -898,7 +918,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
-        if !self.resize_state.load(Ordering::Acquire).is_null() {
+        if self.resize_state.started.load(Ordering::Acquire) {
             return;
         }
         let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
@@ -914,7 +934,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         if !self.shrink_on {
             return;
         }
-        if !self.resize_state.load(Ordering::Acquire).is_null() {
+        if self.resize_state.started.load(Ordering::Acquire) {
             return;
         }
         let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
@@ -925,13 +945,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 
     fn try_resize(&self, hint: ResizeHint) {
-        // Check if resize is already in progress
-        let current_state = self.resize_state.load(Ordering::Acquire);
-        if !current_state.is_null() {
+        // Check if resize is already in progress using the started flag
+        if self.resize_state.started.load(Ordering::Acquire) {
             return;
         }
 
-        // Try to start a new resize - only create ResizeState, not the new table yet
+        // Try to start a new resize
         let old_table = self.load_table();
         let old_len = old_table.mask + 1;
 
@@ -941,64 +960,52 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
         }
 
-        // Calculate parallelism for the resize operation
-        let (_, _chunks) = if old_len >= ASYNC_THRESHOLD && num_cpus::get() > 1 {
-            calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get())
-        } else {
-            (1, 1)
-        };
-
-        // Create resize state (without new table yet - matches Go's approach)
-        let resize_state = Box::new(ResizeState {
-            new_table: AtomicPtr::new(std::ptr::null_mut()), // Initially null
-            chunks: AtomicI32::new(0),                       // Will be set by finalize_resize
-            process: AtomicI32::new(0),
-            completed: AtomicI32::new(0),
-            done: AtomicBool::new(false),
-            hint,
-        });
-
-        let resize_state_ptr = Box::into_raw(resize_state);
-
-        // Try to install resize state
-        match self.resize_state.compare_exchange(
-            std::ptr::null_mut(),
-            resize_state_ptr,
+        // Try to acquire the resize lock by setting started to true
+        match self.resize_state.started.compare_exchange(
+            false,
+            true,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                // Successfully started resize
+                // Successfully started resize, set the hint
                 unsafe {
-                    // Call finalize_resize which will create the new table and call help_copy_and_wait
-                    self.finalize_resize(&*resize_state_ptr);
+                    *self.resize_state.hint.get() = hint;
                 }
+
+                // Reset resize state fields
+                self.resize_state
+                    .new_table
+                    .store(std::ptr::null_mut(), Ordering::Release);
+                self.resize_state.chunks.store(0, Ordering::Release);
+                self.resize_state.process.store(0, Ordering::Release);
+                self.resize_state.completed.store(0, Ordering::Release);
+
+                // Call finalize_resize which will create the new table and call help_copy_and_wait
+                self.finalize_resize();
             }
             Err(_) => {
-                // Another thread started resize, clean up and help
-                unsafe {
-                    let _ = Box::from_raw(resize_state_ptr);
-                }
+                // Another thread started resize, help with the current resize
+                // unsafe {
+                //     self.help_copy_and_wait(&self.resize_state);
+                // }
             }
         }
     }
 
-    unsafe fn help_copy_and_wait(&self, state: &ResizeState<K, V>) {
-        // This method corresponds to Go's helpCopyAndWait function
+    fn help_copy_and_wait(&self) {
+        let state = &self.resize_state;
         let old_table = self.load_table();
         let table_len = old_table.mask + 1;
 
         // Get new table and chunks from state
         let new_table_ptr = state.new_table.load(Ordering::Acquire);
         if new_table_ptr.is_null() {
-            // New table not ready yet, wait for completion
-            while !state.done.load(Ordering::Acquire) {
-                thread::yield_now();
-            }
+            // return if new table not ready yet
             return;
         }
 
-        let new_table = &*new_table_ptr;
+        let new_table = unsafe { &*new_table_ptr };
         let chunks = state.chunks.load(Ordering::Acquire);
 
         // Calculate chunk size
@@ -1011,7 +1018,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let process_prev = state.process.fetch_add(1, Ordering::AcqRel);
             if process_prev >= chunks {
                 // No more work, wait for completion
-                while !state.done.load(Ordering::Acquire) {
+                while state.started.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
                 return;
@@ -1041,21 +1048,14 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 let old_table_ptr = self.table.swap(new_table_ptr, Ordering::AcqRel);
 
                 // Add old table to clean up list
-                let old_table = Box::from_raw(old_table_ptr);
-                (&mut *self.old_tables.get()).push(old_table);
-
-                // Clear resize state pointer first
-                let state_ptr = self
-                    .resize_state
-                    .swap(std::ptr::null_mut(), Ordering::AcqRel);
-
-                // Signal completion (like rs.wg.Done() in Go)
-                state.done.store(true, Ordering::Release);
-
-                // Clean up the resize state
-                if !state_ptr.is_null() {
-                    let _ = Box::from_raw(state_ptr);
+                unsafe {
+                    let old_table = Box::from_raw(old_table_ptr);
+                    (&mut *self.old_tables.get()).push(old_table);
                 }
+                state
+                    .new_table
+                    .store(std::ptr::null_mut(), Ordering::Release);
+                state.started.store(false, Ordering::Release);
                 return;
             }
         }
@@ -1268,22 +1268,20 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         copied
     }
 
-    unsafe fn finalize_resize(&self, state: &ResizeState<K, V>) {
+    fn finalize_resize(&self) {
         // This method corresponds to Go's finalizeResize function
         // It creates the new table and initiates the copy process
-
+        let state = &self.resize_state;
         let old_table = self.load_table();
         let old_len = old_table.mask + 1;
 
         // Calculate new table length based on resize hint
-        let new_len = match state.hint {
+        let new_len = match unsafe { &*state.hint.get() } {
             ResizeHint::Grow => old_len * 2,
             ResizeHint::Shrink => {
                 if old_len <= MIN_TABLE_LEN {
                     // Should not happen, but handle gracefully
-                    self.resize_state
-                        .store(std::ptr::null_mut(), Ordering::Release);
-                    let _ = Box::from_raw(state as *const _ as *mut ResizeState<K, V>);
+                    state.started.store(false, Ordering::Release);
                     return;
                 }
                 old_len / 2
@@ -1305,7 +1303,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
         });
 
-        if state.hint == ResizeHint::Clear {
+        if unsafe { *state.hint.get() } == ResizeHint::Clear {
             // Swap to new empty table
             let old_table_ptr = self.table.swap(Box::into_raw(new_table), Ordering::AcqRel);
 
@@ -1316,8 +1314,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Clear resize state
-            self.resize_state
-                .store(std::ptr::null_mut(), Ordering::Release);
+            state.started.store(false, Ordering::Release);
 
             return;
         }
@@ -1330,7 +1327,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
         // Now call help_copy_and_wait to perform the actual data copying
         // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
-        self.help_copy_and_wait(state);
+        self.help_copy_and_wait();
 
         // Note: help_copy_and_wait handles table swap and resize_state cleanup
         // The resize state will be cleaned up by the thread that completes the last chunk
@@ -1339,7 +1336,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
 impl<K, V> Bucket<K, V> {
     fn new() -> Self {
-        Bucket {
+        Self {
             seq: AtomicU64::new(0),
             meta: AtomicU64::new(0),
             next: AtomicPtr::new(std::ptr::null_mut()),
@@ -1467,7 +1464,7 @@ impl<K, V> Drop for Table<K, V> {
             while !ptr.is_null() {
                 unsafe {
                     let next_ptr = (*ptr).next.load(Ordering::Relaxed);
-                    let _boxed = Box::from_raw(ptr);
+                    let _ = Box::from_raw(ptr);
                     ptr = next_ptr;
                 }
             }
