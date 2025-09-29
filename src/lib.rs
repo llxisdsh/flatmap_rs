@@ -628,7 +628,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
             // Check if resize is in progress before proceeding (like Go version)
             if self.resize_state.started.load(Ordering::Acquire) {
-                let new_table_ready = unsafe { 
+                let new_table_ready = unsafe {
                     if let Some(ref new_table) = *self.resize_state.new_table.get() {
                         new_table.seq_init_done()
                     } else {
@@ -833,7 +833,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                 // Check if resize is in progress and help complete the copy
                 if self.resize_state.started.load(Ordering::Acquire) {
-                    let new_table_ready = unsafe { 
+                    let new_table_ready = unsafe {
                         if let Some(ref new_table) = *self.resize_state.new_table.get() {
                             new_table.seq_init_done()
                         } else {
@@ -961,8 +961,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     fn h2(&self, hash64: u64) -> u8 {
         (hash64 as u8) | (SLOT_MASK as u8)
     }
-
-
 
     #[inline(always)]
     fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
@@ -1413,6 +1411,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 }
 
 impl<K, V> Bucket<K, V> {
+    #[inline(always)]
     fn new() -> Self {
         Self {
             seq: AtomicU64::new(0),
@@ -1421,6 +1420,7 @@ impl<K, V> Bucket<K, V> {
             entries: UnsafeCell::new(std::array::from_fn(|_| Entry::default())),
         }
     }
+    #[inline(always)]
     fn single(_hash: u64, h2: u8, key: K, val: V) -> Self {
         let b = Self::new();
         unsafe {
@@ -1600,7 +1600,7 @@ pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
     });
     items.into_iter()
 }
-
+#[inline(always)]
 fn try_spin(spins: &mut i32) -> bool {
     // Adaptive backoff: spin briefly, then yield to scheduler, then stop
     if *spins < 50 {
