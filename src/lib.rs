@@ -1161,14 +1161,13 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 // Check if slot is marked as occupied and entry is occupied
                 if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
                     let (key, val) = entry.clone_key_value();
-                    //let (hash64, h2) = self.hash_pair(&key);
                     let hash64 = entry.hash;
                     let h2 = self.h2(hash64);
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask());
                     let dest_bucket = new_table.get_bucket(idx);
-                    //dest_bucket.lock();
+                    // dest_bucket.lock();
 
                     // Direct insertion into destination bucket (like Go's appendTo loop)
                     let mut current_dest = dest_bucket;
@@ -1207,7 +1206,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         }
                     }
 
-                    //dest_bucket.unlock();
+                    // dest_bucket.unlock();
                     copied += 1;
                 }
                 marked &= marked - 1;
