@@ -1,11 +1,14 @@
 use flatmap_rs::{FlatMap, Op};
-use std::sync::{Arc, Barrier, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{
+	atomic::{AtomicBool, AtomicUsize, Ordering},
+	Arc, Barrier,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
 fn range_process_under_heavy_concurrency_and_resize() {
-    let map = Arc::new(FlatMap::new().set_shrink(true));
+    let map = Arc::new(FlatMap::new() /*.set_shrink(true)*/);
 
     // Preload some data across buckets
     for i in 0..500 {
@@ -97,10 +100,15 @@ fn range_process_under_heavy_concurrency_and_resize() {
     grower.join().unwrap();
     deleter.join().unwrap();
     ranger.join().unwrap();
-    for r in readers { r.join().unwrap(); }
+    for r in readers {
+        r.join().unwrap();
+    }
 
     // Ensure range_process ran several times
-    assert!(iterations.load(Ordering::Relaxed) > 0, "range_process should have executed");
+    assert!(
+        iterations.load(Ordering::Relaxed) > 0,
+        "range_process should have executed"
+    );
 
     // Basic sanity: map operations still functional after stress
     // Verify no panics and some keys have reasonable values

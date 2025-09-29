@@ -1,0 +1,37 @@
+[package]
+name = "flatmap_rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["llxisdsh"]
+description = "A high-performance concurrent flat hash map implementation in Rust"
+repository = "https://github.com/llxisdsh/flatmap_rs"
+homepage = "https://github.com/llxisdsh/flatmap_rs"
+documentation = "https://docs.rs/flatmap_rs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["hashmap", "concurrent", "lock-free", "performance", "data-structures"]
+categories = ["data-structures", "concurrency", "algorithms"]
+rust-version = "1.70"
+
+[lib]
+name = "flatmap_rs"
+path = "src/lib.rs"
+
+[features]
+default = ["ahash"]
+ahash = ["dep:ahash"]
+std = []
+
+[dependencies]
+ahash = { version = "0.8", optional = true }
+num_cpus = "1.0"
+crossbeam-epoch = "0.9"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+dashmap = "6.0"
+
+[[bench]]
+name = "flatmap"
+harness = false

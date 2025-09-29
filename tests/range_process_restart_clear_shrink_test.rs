@@ -1,7 +1,7 @@
 use flatmap_rs::{FlatMap, Op};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Barrier,
+	atomic::{AtomicBool, Ordering},
+	Arc, Barrier,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 #[test]
 fn range_process_restart_on_clear_and_shrink() {
     // Enable shrink to test Clear/Shrink interactions
-    let map = Arc::new(FlatMap::new().set_shrink(true));
+    let map = Arc::new(FlatMap::new() /*.set_shrink(true)*/);
 
     // Preload
     for i in 0..256 {

@@ -1,5 +1,5 @@
 //! FlatMapOf: a high-performance flat hash map using per-bucket seqlock, ported from Go's pb.FlatMapOf.
-//! Simplified, Rust-idiomatic API focused on speed.
+//! Simplified, Rust-idiomatic API focused on speed with epoch-based memory reclamation.
 
 // use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
@@ -10,12 +10,13 @@ use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
 
 use ahash::RandomState;
+use crossbeam_epoch::{self as epoch, Atomic, Shared};
 const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
 const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
 const SLOT_MASK: u64 = 0x80; // mark a bit in meta byte as slot marker
 const LOAD_FACTOR: f64 = 0.75;
-// const SHRINK_FRACTION: usize = 8;
+const SHRINK_FRACTION: usize = 8;
 const MIN_TABLE_LEN: usize = 32;
 const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000; // highest meta byte's 0x80 bit acts as root lock
 const NUM_STRIPES: usize = 64;
@@ -55,18 +56,18 @@ enum ResizeHint {
 
 // Parallel resize state structure (corresponds to Go's flatResizeState)
 struct ResizeState<K, V> {
-    new_table: AtomicPtr<Table<K, V>>, // Initially null, set by finalizeResize
-    chunks: AtomicI32,                 // Set by finalizeResize
-    process: AtomicI32,                // Atomic counter for work distribution
-    completed: AtomicI32,              // Atomic counter for completed chunks
-    started: AtomicBool,               // Whether resize has started
-    hint: UnsafeCell<ResizeHint>,      // Resize operation type (protected by started)
+    new_table: Atomic<Table<K, V>>, // Initially null, set by finalizeResize
+    chunks: AtomicI32,              // Set by finalizeResize
+    process: AtomicI32,             // Atomic counter for work distribution
+    completed: AtomicI32,           // Atomic counter for completed chunks
+    started: AtomicBool,            // Whether resize has started
+    hint: UnsafeCell<ResizeHint>,   // Resize operation type (protected by started)
 }
 
 impl<K, V> ResizeState<K, V> {
     pub fn new() -> Self {
         Self {
-            new_table: AtomicPtr::new(std::ptr::null_mut()),
+            new_table: Atomic::null(),
             chunks: AtomicI32::new(0),
             process: AtomicI32::new(0),
             completed: AtomicI32::new(0),
@@ -79,12 +80,8 @@ impl<K, V> ResizeState<K, V> {
 impl<K, V> Drop for ResizeState<K, V> {
     fn drop(&mut self) {
         // Clean up new table from resize state if it exists
-        let new_table_ptr = self.new_table.load(Ordering::Acquire);
-        if !new_table_ptr.is_null() {
-            unsafe {
-                let _ = Box::from_raw(new_table_ptr);
-            }
-        }
+        // With epoch-based reclamation, this is handled automatically
+        // when the last reference is dropped
     }
 }
 
@@ -104,10 +101,9 @@ fn calc_parallelism(
 }
 
 pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
-    table: AtomicPtr<Table<K, V>>,
-    old_tables: UnsafeCell<Vec<Box<Table<K, V>>>>,
+    table: Atomic<Table<K, V>>,
     resize_state: ResizeState<K, V>,
-    // shrink_on: bool,
+    shrink_on: bool,
     hasher: S,
 }
 
@@ -233,37 +229,35 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             mask: len - 1,
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
         };
-        let table_ptr = Box::into_raw(Box::new(table));
         Self {
-            table: AtomicPtr::new(table_ptr),
-            old_tables: UnsafeCell::new(Vec::new()),
+            table: Atomic::new(table),
             resize_state: ResizeState::new(),
-            // shrink_on: false,
+            shrink_on: false,
             hasher,
         }
     }
-    //
-    // /// Enable or disable shrinking in-place and return a mutable reference to self.
-    // ///
-    // /// This method is intended for builder-like ergonomics when configuring the map after
-    // /// construction.
-    // /// Enable or disable in-place shrinking and return the map by value.
-    // ///
-    // /// This builder-style method consumes `self` and returns it, making it convenient to chain
-    // /// with temporary values like `FlatMap::new().set_shrink(true)`.
-    // pub fn set_shrink(mut self, enable: bool) -> Self {
-    //     self.shrink_on = enable;
-    //     self
-    // }
-    //
-    // /// Enable or disable in-place shrinking in place and return a mutable reference.
-    // ///
-    // /// This variant does not consume `self` and is useful when you hold the map in a mutable
-    // /// binding and want to configure it without moving.
-    // pub fn set_shrink_mut(&mut self, enable: bool) -> &mut Self {
-    //     self.shrink_on = enable;
-    //     self
-    // }
+
+    /// Enable or disable shrinking in-place and return a mutable reference to self.
+    ///
+    /// This method is intended for builder-like ergonomics when configuring the map after
+    /// construction.
+    /// Enable or disable in-place shrinking and return the map by value.
+    ///
+    /// This builder-style method consumes `self` and returns it, making it convenient to chain
+    /// with temporary values like `FlatMap::new().set_shrink(true)`.
+    pub fn set_shrink(mut self, enable: bool) -> Self {
+        self.shrink_on = enable;
+        self
+    }
+
+    /// Enable or disable in-place shrinking in place and return a mutable reference.
+    ///
+    /// This variant does not consume `self` and is useful when you hold the map in a mutable
+    /// binding and want to configure it without moving.
+    pub fn set_shrink_mut(&mut self, enable: bool) -> &mut Self {
+        self.shrink_on = enable;
+        self
+    }
 
     /// Check whether the given key is present.
     ///
@@ -285,7 +279,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     where
         V: Clone,
     {
-        let table = self.load_table();
+        let guard = epoch::pin();
+        let table_shared = self.load_table(&guard);
+        let table = unsafe { table_shared.as_ref()? };
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask);
         let root = &table.buckets[idx];
@@ -474,7 +470,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
-        let table = self.load_table();
+        let guard = epoch::pin();
+        let table_shared = self.load_table(&guard);
+        let table = unsafe { table_shared.deref() };
         for i in 0..table.buckets.len() {
             let root = &table.buckets[i];
             root.lock();
@@ -571,9 +569,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         V: Clone,
     {
         let (hash64, h2) = self.hash_pair(&key);
+        let guard = epoch::pin();
 
         loop {
-            let table = self.load_table();
+            let table_shared = self.load_table(&guard);
+            let table = unsafe { table_shared.deref() };
             let idx = self.h1_mask(hash64, table.mask);
             let root = &table.buckets[idx];
 
@@ -581,8 +581,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
             // Check if resize is in progress before proceeding (like Go version)
             if self.resize_state.started.load(Ordering::Acquire) {
-                let new_table_ptr = self.resize_state.new_table.load(Ordering::Acquire);
-                if !new_table_ptr.is_null() {
+                let new_table_shared = self.resize_state.new_table.load(Ordering::Acquire, &guard);
+                if !new_table_shared.is_null() {
                     root.unlock();
                     self.help_copy_and_wait();
                     continue; // Retry with new table
@@ -590,7 +590,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Check if table was swapped during lock acquisition
-            let current_table = self.load_table();
+            let current_table_shared = self.load_table(&guard);
+            let current_table = unsafe { current_table_shared.deref() };
             if !std::ptr::eq(table, current_table) {
                 root.unlock();
                 continue; // Retry with new table
@@ -688,7 +689,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         // Update counter
                         let stripe = stripe_index(idx);
                         table.counters[stripe].fetch_sub(1, Ordering::Relaxed);
-                        // self.maybe_resize_after_remove(table);
+                        self.maybe_resize_after_remove(table);
                         (Some(old_val), None)
                     }
                 }
@@ -774,8 +775,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         F: FnMut(&K, &V) -> (Op, Option<V>),
         V: Clone,
     {
+        let guard = epoch::pin();
         'restart: loop {
-            let table = self.load_table();
+            let table_shared = self.load_table(&guard);
+            let table = unsafe { table_shared.deref() };
 
             for i in 0..table.buckets.len() {
                 let root = &table.buckets[i];
@@ -783,7 +786,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                 // Check if resize is in progress and help complete the copy
                 if self.resize_state.started.load(Ordering::Acquire) {
-                    let new_table_ptr = self.resize_state.new_table.load(Ordering::Acquire);
+                    let new_table_ptr = self.resize_state.new_table.load(Ordering::Acquire, &guard);
                     if !new_table_ptr.is_null() {
                         root.unlock();
                         self.help_copy_and_wait();
@@ -792,7 +795,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
 
                 // Check if table has been swapped during resize
-                let current_table = self.load_table();
+                let current_guard = epoch::pin();
+                let current_table_shared = self.load_table(&current_guard);
+                let current_table = unsafe { current_table_shared.deref() };
                 if !std::ptr::eq(table, current_table) {
                     root.unlock();
                     continue 'restart; // Retry with new table
@@ -871,7 +876,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 
     pub fn len(&self) -> usize {
-        let table = self.load_table();
+        let guard = epoch::pin();
+        let table_shared = self.load_table(&guard);
+        let table = unsafe { table_shared.deref() };
         self.sum_counters(table)
     }
     pub fn is_empty(&self) -> bool {
@@ -883,8 +890,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 
     #[inline(always)]
-    fn load_table(&self) -> &Table<K, V> {
-        unsafe { &*self.table.load(Ordering::Acquire) }
+    fn load_table<'g>(&self, guard: &'g epoch::Guard) -> Shared<'g, Table<K, V>> {
+        self.table.load(Ordering::Acquire, guard)
     }
 
     #[inline(always)]
@@ -929,20 +936,20 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
     }
 
-    // #[inline(always)]
-    // fn maybe_resize_after_remove(&self, table: &Table<K, V>) {
-    //     if !self.shrink_on {
-    //         return;
-    //     }
-    //     if self.resize_state.started.load(Ordering::Acquire) {
-    //         return;
-    //     }
-    //     let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
-    //     let total = self.sum_counters(table);
-    //     if cap > MIN_TABLE_LEN * ENTRIES_PER_BUCKET && total.saturating_mul(SHRINK_FRACTION) < cap {
-    //         self.try_resize(ResizeHint::Shrink);
-    //     }
-    // }
+    #[inline(always)]
+    fn maybe_resize_after_remove(&self, table: &Table<K, V>) {
+        if !self.shrink_on {
+            return;
+        }
+        if self.resize_state.started.load(Ordering::Acquire) {
+            return;
+        }
+        let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
+        let total = self.sum_counters(table);
+        if cap > MIN_TABLE_LEN * ENTRIES_PER_BUCKET && total.saturating_mul(SHRINK_FRACTION) < cap {
+            self.try_resize(ResizeHint::Shrink);
+        }
+    }
 
     fn try_resize(&self, hint: ResizeHint) {
         // Check if resize is already in progress using the started flag
@@ -951,7 +958,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
 
         // Try to start a new resize
-        let old_table = self.load_table();
+        let guard = epoch::pin();
+        let old_table_shared = self.load_table(&guard);
+        let old_table = unsafe { old_table_shared.deref() };
         let old_len = old_table.mask + 1;
 
         if hint == ResizeHint::Shrink {
@@ -976,7 +985,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 // Reset resize state fields
                 self.resize_state
                     .new_table
-                    .store(std::ptr::null_mut(), Ordering::Release);
+                    .store(Shared::null(), Ordering::Release);
                 self.resize_state.chunks.store(0, Ordering::Release);
                 self.resize_state.process.store(0, Ordering::Release);
                 self.resize_state.completed.store(0, Ordering::Release);
@@ -995,17 +1004,19 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     fn help_copy_and_wait(&self) {
         let state = &self.resize_state;
-        let old_table = self.load_table();
+        let guard = epoch::pin();
+        let old_table_shared = self.load_table(&guard);
+        let old_table = unsafe { old_table_shared.deref() };
         let table_len = old_table.mask + 1;
 
         // Get new table and chunks from state
-        let new_table_ptr = state.new_table.load(Ordering::Acquire);
-        if new_table_ptr.is_null() {
+        let new_table_shared = state.new_table.load(Ordering::Acquire, &guard);
+        if new_table_shared.is_null() {
             // return if new table not ready yet
             return;
         }
 
-        let new_table = unsafe { &*new_table_ptr };
+        let new_table = unsafe { new_table_shared.deref() };
         let chunks = state.chunks.load(Ordering::Acquire);
 
         // Calculate chunk size
@@ -1044,17 +1055,17 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let completed = state.completed.fetch_add(1, Ordering::AcqRel) + 1;
             if completed == chunks {
                 // All chunks completed, finalize the table swap
-                let new_table_ptr = state.new_table.load(Ordering::Acquire);
-                let old_table_ptr = self.table.swap(new_table_ptr, Ordering::AcqRel);
+                let new_table_shared = state.new_table.load(Ordering::Acquire, &guard);
+                let old_table_shared = self.table.swap(new_table_shared, Ordering::AcqRel, &guard);
 
-                // Add old table to clean up list
+                // Schedule old table for deferred deallocation
                 unsafe {
-                    let old_table = Box::from_raw(old_table_ptr);
-                    (&mut *self.old_tables.get()).push(old_table);
+                    guard.defer_destroy(old_table_shared);
                 }
+
                 state
                     .new_table
-                    .store(std::ptr::null_mut(), Ordering::Release);
+                    .store(epoch::Shared::null(), Ordering::Release);
                 state.started.store(false, Ordering::Release);
                 return;
             }
@@ -1272,7 +1283,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // This method corresponds to Go's finalizeResize function
         // It creates the new table and initiates the copy process
         let state = &self.resize_state;
-        let old_table = self.load_table();
+        let guard = epoch::pin();
+        let old_table_shared = self.load_table(&guard);
+        let old_table = unsafe { old_table_shared.deref() };
         let old_len = old_table.mask + 1;
 
         // Calculate new table length based on resize hint
@@ -1297,20 +1310,20 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         for _ in 0..new_len {
             buckets.push(Bucket::new());
         }
-        let new_table = Box::new(Table {
+        let new_table = Table {
             buckets,
             mask: new_len - 1,
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
-        });
+        };
 
         if unsafe { *state.hint.get() } == ResizeHint::Clear {
-            // Swap to new empty table
-            let old_table_ptr = self.table.swap(Box::into_raw(new_table), Ordering::AcqRel);
+            // Swap to new empty table using epoch
+            let new_table_owned = epoch::Owned::new(new_table);
+            let old_table_shared = self.table.swap(new_table_owned, Ordering::AcqRel, &guard);
 
-            // Add old table to clean up list
+            // Schedule old table for deferred deallocation
             unsafe {
-                let old_tables = &mut *self.old_tables.get();
-                old_tables.push(Box::from_raw(old_table_ptr));
+                guard.defer_destroy(old_table_shared);
             }
 
             // Clear resize state
@@ -1321,9 +1334,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
         // Store chunks and new table in the resize state
         state.chunks.store(chunks as i32, Ordering::Release);
-        state
-            .new_table
-            .store(Box::into_raw(new_table), Ordering::Release);
+        let new_table_owned = epoch::Owned::new(new_table);
+        state.new_table.store(new_table_owned, Ordering::Release);
 
         // Now call help_copy_and_wait to perform the actual data copying
         // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
@@ -1441,19 +1453,8 @@ fn try_spin(spins: &mut i32) -> bool {
 
 impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
     fn drop(&mut self) {
-        // Clean up current table
-        let table_ptr = self.table.load(Ordering::Acquire);
-        if !table_ptr.is_null() {
-            unsafe {
-                let _ = Box::from_raw(table_ptr);
-            }
-        }
-
-        // Clean up old tables
-        unsafe {
-            let old_tables = &mut *self.old_tables.get();
-            old_tables.clear();
-        }
+        // With epoch-based reclamation, memory is automatically managed
+        // No manual cleanup needed as epoch handles deallocation
     }
 }
 
