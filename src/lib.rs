@@ -43,6 +43,9 @@ const MIN_BUCKETS_PER_CPU: usize = 64;
 /// Over-partition factor for resize to reduce tail latency
 const RESIZE_OVER_PARTITION: usize = 4;
 
+/// pure CPU hints before any yield
+const SPIN_BEFORE_YIELD: i32 = 128;
+
 // ================================================================================================
 // UTILITY FUNCTIONS
 // ================================================================================================
@@ -394,12 +397,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     // Check seqlock immediately after copying (like Go version)
                     let s2 = b.seq.load(Ordering::Acquire);
                     if s1 != s2 {
-                        if try_spin(&mut spins) {
-                            continue 'retry;
-                        }
-                        // Too many spins, need fallback
-                        need_fallback = true;
-                        break 'retry;
+                        // Seqlock mismatch, retry now
+                        continue 'retry;
                     }
 
                     // Validate the copied entry
@@ -1354,11 +1353,9 @@ impl<K, V> Bucket<K, V> {
                 {
                     break;
                 }
+                continue;
             }
-            // Backoff/spin
-            if !try_spin(&mut spins) {
-                std::hint::spin_loop();
-            }
+            delay(&mut spins);
         }
     }
 
@@ -1691,17 +1688,23 @@ fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
 
 #[inline(always)]
 fn try_spin(spins: &mut i32) -> bool {
-    // Adaptive backoff: spin briefly, then yield to scheduler, then stop
-    if *spins < 50 {
-        *spins += 1;
+    if *spins < SPIN_BEFORE_YIELD {
+        *spins += *spins + 1;
         std::hint::spin_loop();
-        true
-    } else if *spins < 100 {
-        *spins += 1;
-        thread::yield_now();
         true
     } else {
         false
+    }
+}
+
+#[inline(always)]
+fn delay(spins: &mut i32) {
+    if *spins < SPIN_BEFORE_YIELD {
+        *spins += *spins + 1;
+        std::hint::spin_loop();
+    } else {
+        *spins = 0;
+        thread::yield_now();
     }
 }
 
