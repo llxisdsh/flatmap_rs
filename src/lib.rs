@@ -346,7 +346,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     where
         V: Clone,
     {
-        let table = self.load_table();
+        let table = self.table.seq_load();
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask());
         let root = table.get_bucket(idx);
@@ -374,7 +374,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     break 'retry;
                 }
 
-                let meta = b.meta.load(Ordering::Acquire);
+                let meta = b.meta.load(Ordering::Relaxed);
                 let mut marked = mark_zero_bytes(meta ^ h2w);
 
                 // Process each marked entry (like Go version)
@@ -529,7 +529,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
-        let table = self.load_table();
+        let table = self.table.seq_load();
         for i in 0..(table.mask() + 1) {
             let root = table.get_bucket(i);
             root.lock();
@@ -622,14 +622,14 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let (hash64, h2) = self.hash_pair(&key);
 
         loop {
-            let table = self.load_table();
+            let table = self.table.seq_load();
             let idx = self.h1_mask(hash64, table.mask());
             let root = table.get_bucket(idx);
 
             root.lock();
 
             // Check if resize is in progress before proceeding (like Go version)
-            if self.resize_state.started.load(Ordering::Relaxed)
+            if self.resize_state.started.load(Ordering::Acquire)
                 && self.resize_state.is_new_table_ready()
             {
                 root.unlock();
@@ -638,7 +638,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Check if table was swapped during lock acquisition
-            let current_table = self.load_table();
+            let current_table = self.table.seq_load();
             if table.seq.load(Ordering::Relaxed) != current_table.seq.load(Ordering::Relaxed) {
                 root.unlock();
                 continue; // Retry with new table
@@ -704,7 +704,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         if let Some(new_v) = new_val {
                             // Use seqlock to protect the write operation (like Go)
                             let seq = bucket.seq.load(Ordering::Relaxed);
-                            bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                            bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
                             entry.val = MaybeUninit::new(new_v.clone());
                             bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
                             root.unlock();
@@ -720,8 +720,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         let meta = bucket.meta.load(Ordering::Relaxed);
                         let new_meta = set_byte(meta, EMPTY_SLOT, slot);
                         let seq = bucket.seq.load(Ordering::Relaxed);
-                        bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
-                        bucket.meta.store(new_meta, Ordering::Release);
+                        bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                        bucket.meta.store(new_meta, Ordering::Relaxed);
                         bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
 
                         // After publishing even seq, clear entry fields before releasing root lock
@@ -761,10 +761,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                                 // Use seqlock to protect the meta update (like Go)
                                 let seq = empty_bucket.seq.load(Ordering::Relaxed);
-                                empty_bucket.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                                empty_bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
                                                                                     // Publish meta while still holding the root lock to ensure
                                                                                     // no other writer starts while this bucket is in odd state
-                                empty_bucket.meta.store(new_meta, Ordering::Release);
+                                empty_bucket.meta.store(new_meta, Ordering::Relaxed);
                                 // Complete seqlock write (make it even) before releasing root lock
                                 empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
                                 root.unlock();
@@ -816,14 +816,14 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         V: Clone,
     {
         'restart: loop {
-            let table = self.load_table();
+            let table = self.table.seq_load();
 
             for i in 0..(table.mask() + 1) {
                 let root = table.get_bucket(i);
                 root.lock();
 
                 // Check if resize is in progress and help complete the copy
-                if self.resize_state.started.load(Ordering::Relaxed)
+                if self.resize_state.started.load(Ordering::Acquire)
                     && self.resize_state.is_new_table_ready()
                 {
                     root.unlock();
@@ -832,8 +832,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
 
                 // Check if table has been swapped during resize
-                let current_table = self.load_table();
-                if table.seq.load(Ordering::Relaxed) != current_table.seq.load(Ordering::Relaxed) {
+                let current_table = self.table.seq_load();
+                if table.buckets() != current_table.buckets() {
                     root.unlock();
                     continue 'restart; // Retry with new table
                 }
@@ -862,7 +862,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                     if let Some(new_v) = new_val {
                                         // Use seqlock to protect the write operation (like process method)
                                         let seq = b.seq.load(Ordering::Relaxed);
-                                        b.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
+                                        b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
                                         unsafe {
                                             std::ptr::drop_in_place(entry.val.as_mut_ptr());
                                             entry.val.write(new_v);
@@ -875,8 +875,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                     // Keep snapshot fresh to prevent stale meta
                                     meta = set_byte(meta, EMPTY_SLOT, j);
                                     let seq = b.seq.load(Ordering::Relaxed);
-                                    b.seq.store(seq + 1, Ordering::Release); // Start write (make odd)
-                                    b.meta.store(meta, Ordering::Release);
+                                    b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                                    b.meta.store(meta, Ordering::Relaxed);
                                     b.seq.store(seq + 2, Ordering::Release); // End write (make even)
 
                                     // Clear the entry AFTER seqlock protection (like process method)
@@ -910,21 +910,16 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 
     pub fn len(&self) -> usize {
-        let table = self.load_table();
+        let table = self.table.seq_load();
         table.sum_size()
     }
     pub fn is_empty(&self) -> bool {
-        let table = self.load_table();
+        let table = self.table.seq_load();
         !table.sum_size_exceeds(0)
     }
 
     pub fn clear(&self) {
         self.try_resize(ResizeHint::Clear);
-    }
-
-    #[inline(always)]
-    fn load_table(&self) -> Table<K, V> {
-        self.table.seq_load()
     }
 
     #[inline(always)]
@@ -981,7 +976,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
 
         // Try to start a new resize
-        let old_table = self.load_table();
+        let old_table = self.table.seq_load();
         let old_len = old_table.mask() + 1;
 
         if hint == ResizeHint::Shrink {
@@ -1025,7 +1020,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     fn help_copy_and_wait(&self) {
         let state = &self.resize_state;
-        let old_table = self.load_table();
+        if !state.started.load(Ordering::Acquire) {
+            return;
+        }
+
+        let old_table = self.table.seq_load();
         let table_len = old_table.mask() + 1;
 
         // Get new table and chunks from state
@@ -1216,7 +1215,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // This method corresponds to Go's finalizeResize function
         // It creates the new table and initiates the copy process
         let state = &self.resize_state;
-        let old_table = self.load_table();
+        let old_table = self.table.seq_load();
         let old_len = old_table.mask() + 1;
 
         // Calculate new table length based on resize hint
@@ -1457,7 +1456,7 @@ impl<K, V> Table<K, V> {
     #[inline(always)]
     fn seq_store(&self, new_table: &Table<K, V>) {
         let s = self.seq.load(Ordering::Relaxed);
-        self.seq.store(s + 1, Ordering::Release); // Make odd (write in progress)
+        self.seq.store(s + 1, Ordering::Relaxed); // Make odd (write in progress)
 
         // Update table fields
         unsafe {
