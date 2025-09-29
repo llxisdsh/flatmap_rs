@@ -3,7 +3,7 @@
 
 // use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use std::cell::UnsafeCell;
@@ -122,7 +122,7 @@ unsafe impl<K: Sync, V: Sync, S: Sync + BuildHasher> Sync for FlatMap<K, V, S> {
 struct Table<K, V> {
     buckets: *mut Bucket<K, V>,
     mask: usize,
-    counters: *mut AtomicU64,
+    counters: *mut AtomicUsize,
     counters_mask: usize,
 }
 
@@ -248,8 +248,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
 
         // Allocate counters as raw pointer
-        let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
-        let counters_ptr = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicU64 };
+        let counters_layout = std::alloc::Layout::array::<AtomicUsize>(counters_len).unwrap();
+        let counters_ptr = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicUsize };
         if counters_ptr.is_null() {
             std::alloc::handle_alloc_error(counters_layout);
         }
@@ -257,7 +257,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // Initialize counters
         for i in 0..counters_len {
             unsafe {
-                std::ptr::write(counters_ptr.add(i), AtomicU64::new(0));
+                std::ptr::write(counters_ptr.add(i), AtomicUsize::new(0));
             }
         }
 
@@ -947,7 +947,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     fn sum_counters(&self, table: &Table<K, V>) -> usize {
         let mut s = 0usize;
         for i in 0..(table.counters_mask + 1) {
-            let c = unsafe { &*table.counters.add(i) }.load(Ordering::Relaxed) as usize;
+            let c = unsafe { &*table.counters.add(i) }.load(Ordering::Relaxed);
             s = s.wrapping_add(c);
         }
         s
@@ -1130,7 +1130,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         if total_copied > 0 {
             let stripe = start & new_table.counters_mask;
             unsafe { &*new_table.counters.add(stripe) }
-                .fetch_add(total_copied as u64, Ordering::Relaxed);
+                .fetch_add(total_copied, Ordering::Relaxed);
         }
     }
 
@@ -1347,8 +1347,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
         // Allocate and initialize counters
         let counters_len = calc_size_len(new_len, num_cpus::get());
-        let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
-        let counters = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicU64 };
+        let counters_layout = std::alloc::Layout::array::<AtomicUsize>(counters_len).unwrap();
+        let counters = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicUsize };
         if counters.is_null() {
             std::alloc::handle_alloc_error(counters_layout);
         }
@@ -1356,7 +1356,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // Initialize counters
         for i in 0..counters_len {
             unsafe {
-                std::ptr::write(counters.add(i), AtomicU64::new(0));
+                std::ptr::write(counters.add(i), AtomicUsize::new(0));
             }
         }
 
@@ -1552,9 +1552,9 @@ impl<K, V> Drop for Table<K, V> {
         if !self.counters.is_null() {
             let counters_len = self.counters_mask + 1;
 
-            // AtomicU64 doesn't need drop_in_place, just deallocate memory
+            // AtomicUsize doesn't need drop_in_place, just deallocate memory
             unsafe {
-                let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
+                let counters_layout = std::alloc::Layout::array::<AtomicUsize>(counters_len).unwrap();
                 std::alloc::dealloc(self.counters as *mut u8, counters_layout);
             }
         }
