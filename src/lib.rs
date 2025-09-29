@@ -5,7 +5,7 @@ use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
-	AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
@@ -759,7 +759,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                             std::ptr::drop_in_place(entry.val.as_mut_ptr());
                         }
 
-                        root.unlock();
+                        if std::ptr::eq(bucket, root) {
+                            root.unlock_with_meta(new_meta);
+                        } else {
+                            root.unlock();
+                        }
+
                         // Update counter
                         table.add_size(idx, -1);
                         // self.maybe_resize_after_remove(table);
@@ -795,7 +800,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 empty_bucket.meta.store(new_meta, Ordering::Relaxed);
                                 // Complete seqlock write (make it even) before releasing root lock
                                 empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
-                                root.unlock();
+
+                                if std::ptr::eq(empty_bucket, root) {
+                                    root.unlock_with_meta(new_meta);
+                                } else {
+                                    root.unlock();
+                                }
 
                                 // Update counter
                                 table.add_size(idx, 1);
@@ -809,6 +819,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                                 // Link new bucket
                                 last_bucket.next.store(new_bucket_ptr, Ordering::Release);
+                                // Unlock root after linking overflow bucket
                                 root.unlock();
 
                                 // Update counter
@@ -1326,33 +1337,43 @@ impl<K, V> Bucket<K, V> {
 
     #[inline(always)]
     fn lock(&self) {
-        // Root bucket lock using meta's highest byte bit, independent of seq seqlock
-        let mut cur = self.meta.load(Ordering::Relaxed);
+        let mut spins = 0;
         loop {
+            // Attempt lock if not held
+            let cur = self.meta.load(Ordering::Relaxed);
             if (cur & OP_LOCK_MASK) == 0 {
-                match self.meta.compare_exchange_weak(
-                    cur,
-                    cur | OP_LOCK_MASK,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(next) => {
-                        cur = next;
-                        continue;
-                    }
+                if self
+                    .meta
+                    .compare_exchange(
+                        cur,
+                        cur | OP_LOCK_MASK,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
                 }
-            } else {
+            }
+            // Backoff/spin
+            if !try_spin(&mut spins) {
                 std::hint::spin_loop();
-                cur = self.meta.load(Ordering::Relaxed);
             }
         }
     }
 
     #[inline(always)]
     fn unlock(&self) {
-        // Release root bucket lock by clearing the bit
-        self.meta.fetch_and(!OP_LOCK_MASK, Ordering::Release);
+        // Release root bucket lock by clearing the bit via Store
+        // Using Store(clear-bit) avoids RMW cost of fetch_and
+        let cur = self.meta.load(Ordering::Relaxed);
+        self.meta.store(cur & !OP_LOCK_MASK, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn unlock_with_meta(&self, meta: u64) {
+        // Clear lock bit while publishing a specific meta value
+        self.meta.store(meta & !OP_LOCK_MASK, Ordering::Release);
     }
 
     /// Safe entries access helpers
