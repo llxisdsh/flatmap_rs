@@ -34,3 +34,11 @@ dashmap = "6.0"
 [[bench]]
 name = "flatmap"
 harness = false
+
+[[bench]]
+name = "throughput_comparison"
+harness = false
+
+[[bench]]
+name = "multi_thread_throughput"
+harness = false
