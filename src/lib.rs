@@ -383,7 +383,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     let e = &entries_ref[j];
 
                     // Copy only hash first to filter out mismatches without cloning key/val
-                    if !e.is_occupied() || !e.equal_hash(hash64) {
+                    if !e.equal_hash(hash64) {
                         marked &= marked - 1;
                         continue;
                     }
@@ -645,7 +645,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         V: Clone,
     {
         let (hash64, h2) = self.hash_pair(&key);
-
+        let h2w = broadcast(h2);
         loop {
             let table = self.table.seq_load();
             let idx = self.h1_mask(hash64, table.mask());
@@ -669,11 +669,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Search for existing key and track empty slots
-            let mut b = root;
             let mut found_info: Option<(*mut Bucket<K, V>, usize)> = None;
             let mut empty_slot_info: Option<(*const Bucket<K, V>, usize)> = None;
-            let h2w = broadcast(h2);
 
+            let mut b = root;
             'search_loop: loop {
                 let entries = b.get_entries();
                 let meta = b.meta.load(Ordering::Relaxed);
@@ -868,46 +867,45 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         let j = first_marked_byte_index(marked);
                         let entry = &mut entries[j];
 
-                        if entry.is_occupied() {
-                            let key = entry.get_key();
-                            let val = entry.get_value();
-                            let (op, new_val) = f(key, val);
+                        let key = entry.get_key();
+                        let val = entry.get_value();
 
-                            match op {
-                                Op::Cancel => {
-                                    // No-op
-                                }
-                                Op::Update => {
-                                    if let Some(new_v) = new_val {
-                                        // Use seqlock to protect the write operation (like process method)
-                                        let seq = b.seq.load(Ordering::Relaxed);
-                                        b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                        unsafe {
-                                            std::ptr::drop_in_place(entry.val.as_mut_ptr());
-                                            entry.val.write(new_v);
-                                        }
-                                        b.seq.store(seq + 2, Ordering::Release);
-                                        // End write (make even)
-                                    }
-                                }
-                                Op::Delete => {
-                                    // Keep snapshot fresh to prevent stale meta
-                                    meta = set_byte(meta, EMPTY_SLOT, j);
+                        let (op, new_val) = f(key, val);
+
+                        match op {
+                            Op::Cancel => {
+                                // No-op
+                            }
+                            Op::Update => {
+                                if let Some(new_v) = new_val {
+                                    // Use seqlock to protect the write operation (like process method)
                                     let seq = b.seq.load(Ordering::Relaxed);
                                     b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                    b.meta.store(meta, Ordering::Relaxed);
-                                    b.seq.store(seq + 2, Ordering::Release); // End write (make even)
-
-                                    // Clear the entry AFTER seqlock protection (like process method)
-                                    entry.clear();
                                     unsafe {
-                                        std::ptr::drop_in_place(entry.key.as_mut_ptr());
                                         std::ptr::drop_in_place(entry.val.as_mut_ptr());
+                                        entry.val.write(new_v);
                                     }
-
-                                    // Decrement counter using bucket index like Go version
-                                    table.add_size(i, -1);
+                                    b.seq.store(seq + 2, Ordering::Release);
+                                    // End write (make even)
                                 }
+                            }
+                            Op::Delete => {
+                                // Keep snapshot fresh to prevent stale meta
+                                meta = set_byte(meta, EMPTY_SLOT, j);
+                                let seq = b.seq.load(Ordering::Relaxed);
+                                b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                                b.meta.store(meta, Ordering::Relaxed);
+                                b.seq.store(seq + 2, Ordering::Release); // End write (make even)
+
+                                // Clear the entry AFTER seqlock protection (like process method)
+                                entry.clear();
+                                unsafe {
+                                    std::ptr::drop_in_place(entry.key.as_mut_ptr());
+                                    std::ptr::drop_in_place(entry.val.as_mut_ptr());
+                                }
+
+                                // Decrement counter using bucket index like Go version
+                                table.add_size(i, -1);
                             }
                         }
 
@@ -1140,56 +1138,54 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 let entry = &entries_ref[j];
 
                 // Check if slot is marked as occupied and entry is occupied
-                if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
-                    let (key, val) = entry.clone_key_value();
-                    let hash64 = entry.hash;
-                    let h2 = self.h2(hash64);
+                let (key, val) = entry.clone_key_value();
+                let hash64 = entry.hash;
+                let h2 = self.h2(hash64);
 
-                    // For shrink operations, lock destination bucket during insertion
-                    let idx = self.h1_mask(hash64, new_table.mask());
-                    let dest_bucket = new_table.get_bucket(idx);
-                    // dest_bucket.lock();
+                // For shrink operations, lock destination bucket during insertion
+                let idx = self.h1_mask(hash64, new_table.mask());
+                let dest_bucket = new_table.get_bucket(idx);
+                // dest_bucket.lock();
 
-                    // Direct insertion into destination bucket (like Go's appendTo loop)
-                    let mut current_dest = dest_bucket;
-                    'append_to: loop {
-                        let dest_meta = current_dest.meta.load(Ordering::Relaxed);
-                        let empty = (!dest_meta) & META_MASK;
+                // Direct insertion into destination bucket (like Go's appendTo loop)
+                let mut current_dest = dest_bucket;
+                'append_to: loop {
+                    let dest_meta = current_dest.meta.load(Ordering::Relaxed);
+                    let empty = (!dest_meta) & META_MASK;
 
-                        if empty != 0 {
-                            // Found empty slot
-                            let empty_idx = first_marked_byte_index(empty);
-                            let new_meta = set_byte(dest_meta, h2, empty_idx);
+                    if empty != 0 {
+                        // Found empty slot
+                        let empty_idx = first_marked_byte_index(empty);
+                        let new_meta = set_byte(dest_meta, h2, empty_idx);
 
-                            unsafe {
-                                // Follow Go's order: meta first, then value, hash, key
-                                current_dest.meta.store(new_meta, Ordering::Relaxed);
-                                let dest_entries = &mut *current_dest.entries.get();
-                                dest_entries[empty_idx].val.as_mut_ptr().write(val.clone());
-                                dest_entries[empty_idx].set_hash(hash64);
-                                dest_entries[empty_idx].key.as_mut_ptr().write(key.clone());
-                            }
-                            break 'append_to;
+                        unsafe {
+                            // Follow Go's order: meta first, then value, hash, key
+                            current_dest.meta.store(new_meta, Ordering::Relaxed);
+                            let dest_entries = &mut *current_dest.entries.get();
+                            dest_entries[empty_idx].val.as_mut_ptr().write(val.clone());
+                            dest_entries[empty_idx].set_hash(hash64);
+                            dest_entries[empty_idx].key.as_mut_ptr().write(key.clone());
                         }
-
-                        // No empty slot, check for next bucket
-                        let next_ptr = current_dest.next.load(Ordering::Relaxed);
-                        if next_ptr.is_null() {
-                            // Create new overflow bucket
-                            let new_bucket =
-                                Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
-                            let new_ptr = Box::into_raw(new_bucket);
-                            current_dest.next.store(new_ptr, Ordering::Relaxed);
-
-                            break 'append_to;
-                        } else {
-                            current_dest = unsafe { &*next_ptr };
-                        }
+                        break 'append_to;
                     }
 
-                    // dest_bucket.unlock();
-                    copied += 1;
+                    // No empty slot, check for next bucket
+                    let next_ptr = current_dest.next.load(Ordering::Relaxed);
+                    if next_ptr.is_null() {
+                        // Create new overflow bucket
+                        let new_bucket =
+                            Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
+                        let new_ptr = Box::into_raw(new_bucket);
+                        current_dest.next.store(new_ptr, Ordering::Relaxed);
+
+                        break 'append_to;
+                    } else {
+                        current_dest = unsafe { &*next_ptr };
+                    }
                 }
+
+                // dest_bucket.unlock();
+                copied += 1;
                 marked &= marked - 1;
             }
 
@@ -1547,10 +1543,10 @@ impl<K, V> Table<K, V> {
 
 impl<K, V> Entry<K, V> {
     /// Check if this entry is initialized (occupied)
-    #[inline(always)]
-    fn is_occupied(&self) -> bool {
-        self.hash != 0
-    }
+    // #[inline(always)]
+    // fn is_occupied(&self) -> bool {
+    //     self.hash != 0
+    // }
 
     /// Get the actual hash value (without the init flag)
     #[inline(always)]
@@ -1573,14 +1569,14 @@ impl<K, V> Entry<K, V> {
     /// Safe key access for occupied entries
     #[inline(always)]
     fn get_key(&self) -> &K {
-        debug_assert!(self.is_occupied(), "Entry must be occupied to access key");
+        // debug_assert!(self.is_occupied(), "Entry must be occupied to access key");
         unsafe { self.key.assume_init_ref() }
     }
 
     /// Safe value access for occupied entries
     #[inline(always)]
     fn get_value(&self) -> &V {
-        debug_assert!(self.is_occupied(), "Entry must be occupied to access value");
+        // debug_assert!(self.is_occupied(), "Entry must be occupied to access value");
         unsafe { self.val.assume_init_ref() }
     }
 
@@ -1590,7 +1586,7 @@ impl<K, V> Entry<K, V> {
     // where
     //     K: Clone,
     // {
-    //     debug_assert!(self.is_occupied(), "Entry must be occupied to clone key");
+    //     // debug_assert!(self.is_occupied(), "Entry must be occupied to clone key");
     //     unsafe { self.key.assume_init_ref().clone() }
     // }
 
@@ -1600,7 +1596,7 @@ impl<K, V> Entry<K, V> {
     where
         V: Clone,
     {
-        debug_assert!(self.is_occupied(), "Entry must be occupied to clone value");
+        // debug_assert!(self.is_occupied(), "Entry must be occupied to clone value");
         unsafe { self.val.assume_init_ref().clone() }
     }
 
@@ -1611,10 +1607,10 @@ impl<K, V> Entry<K, V> {
         K: Clone,
         V: Clone,
     {
-        debug_assert!(
-            self.is_occupied(),
-            "Entry must be occupied to clone key-value"
-        );
+        // debug_assert!(
+        //     self.is_occupied(),
+        //     "Entry must be occupied to clone key-value"
+        // );
         unsafe {
             (
                 self.key.assume_init_ref().clone(),
