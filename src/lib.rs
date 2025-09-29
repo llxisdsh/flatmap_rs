@@ -4,7 +4,7 @@
 // use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
-	AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
@@ -17,6 +17,9 @@ const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
 const SLOT_MASK: u64 = 0x80; // mark a bit in meta byte as slot marker
 const LOAD_FACTOR: f64 = 0.75;
+// Frequent hash table resizing (both expansion and contraction) results in an accumulation
+// of old tables, ultimately leading to increased memory occupancy.
+// This capability has been temporarily disabled to prevent memory issues.
 // const SHRINK_FRACTION: usize = 8;
 const MIN_TABLE_LEN: usize = 32;
 const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000; // highest meta byte's 0x80 bit acts as root lock
@@ -77,6 +80,17 @@ impl<K, V> ResizeState<K, V> {
             completed: AtomicI32::new(0),
             started: AtomicBool::new(false),
             hint: UnsafeCell::new(ResizeHint::Grow),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_new_table_ready(&self) -> bool {
+        unsafe {
+            if let Some(ref new_table) = *self.new_table.get() {
+                new_table.seq.load(Ordering::Acquire) == 2
+            } else {
+                false
+            }
         }
     }
 }
@@ -335,15 +349,17 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let table = self.load_table();
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask());
-        let root = unsafe { &*table.buckets().add(idx) };
+        let root = table.get_bucket(idx);
         let h2w = broadcast(hash_u8);
 
         // Traverse bucket chain (like Go version)
-        let mut bucket_ptr = root as *const Bucket<K, V>;
+        let mut bucket_opt = Some(root);
         let mut need_fallback = false;
 
-        while !bucket_ptr.is_null() && !need_fallback {
-            let b = unsafe { &*bucket_ptr };
+        while let Some(b) = bucket_opt {
+            if need_fallback {
+                break;
+            }
             let mut spins = 0;
 
             'retry: loop {
@@ -364,7 +380,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 // Process each marked entry (like Go version)
                 while marked != 0 {
                     let j = first_marked_byte_index(marked);
-                    let entries_ref = unsafe { &*b.entries.get() };
+                    let entries_ref = b.get_entries();
                     let e = &entries_ref[j];
 
                     // Copy only hash first to filter out mismatches without cloning key/val
@@ -374,12 +390,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     }
 
                     // For potential matches, copy key and val before seqlock check
-                    let (entry_key, entry_val) = unsafe {
-                        (
-                            e.key.assume_init_ref().clone(),
-                            e.val.assume_init_ref().clone(),
-                        )
-                    };
+                    let (entry_key, entry_val) = unsafe { e.unsafe_clone_key_value() };
 
                     // Check seqlock immediately after copying (like Go version)
                     let s2 = b.seq.load(Ordering::Acquire);
@@ -401,7 +412,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
 
                 // Successfully processed this bucket, move to next
-                bucket_ptr = b.next.load(Ordering::Acquire);
+                bucket_opt = b.get_next_bucket();
                 break 'retry;
             }
         }
@@ -409,29 +420,26 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // Fallback: locked read (like Go version)
         if need_fallback {
             root.lock();
-            bucket_ptr = root as *const Bucket<K, V>;
-            while !bucket_ptr.is_null() {
-                let bb = unsafe { &*bucket_ptr };
+            let mut bucket_opt_locked = Some(root);
+            while let Some(bb) = bucket_opt_locked {
                 let meta_locked = bb.meta.load(Ordering::Relaxed);
                 let mut marked_locked = mark_zero_bytes(meta_locked ^ h2w);
 
                 while marked_locked != 0 {
                     let j = first_marked_byte_index(marked_locked);
-                    let entries_ref = unsafe { &*bb.entries.get() };
+                    let entries_ref = bb.get_entries();
                     let e = &entries_ref[j];
 
                     if e.equal_hash(hash64) {
-                        unsafe {
-                            if e.key.assume_init_ref() == key {
-                                let result = e.val.assume_init_ref().clone();
-                                root.unlock();
-                                return Some(result);
-                            }
+                        if e.get_key() == key {
+                            let result = e.clone_value();
+                            root.unlock();
+                            return Some(result);
                         }
                     }
                     marked_locked &= marked_locked - 1;
                 }
-                bucket_ptr = bb.next.load(Ordering::Relaxed);
+                bucket_opt_locked = bb.get_next_bucket_relaxed();
             }
             root.unlock();
         }
@@ -523,12 +531,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // tearing, then callback user closure after unlock
         let table = self.load_table();
         for i in 0..(table.mask() + 1) {
-            let root = unsafe { &*table.buckets().add(i) };
+            let root = table.get_bucket(i);
             root.lock();
-            let mut b = root;
+            let mut bucket_opt = Some(root);
             let mut items: Vec<(K, V)> = Vec::new();
-            loop {
-                let entries_ref = unsafe { &*b.entries.get() };
+            while let Some(b) = bucket_opt {
+                let entries_ref = b.get_entries();
                 let meta = b.meta.load(Ordering::Relaxed);
                 let mut marked = meta & META_MASK;
                 while marked != 0 {
@@ -536,18 +544,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     let e = &entries_ref[j];
                     // Only access key/value if slot is marked as occupied in meta
                     if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                        let k = unsafe { e.key.assume_init_ref().clone() };
-                        let v = unsafe { e.val.assume_init_ref().clone() };
+                        let (k, v) = unsafe { e.unsafe_clone_key_value() };
                         items.push((k, v));
                     }
                     marked &= marked - 1;
                 }
-                let next_ptr = b.next.load(Ordering::Relaxed);
-                if !next_ptr.is_null() {
-                    b = unsafe { &*next_ptr };
-                } else {
-                    break;
-                }
+                bucket_opt = b.get_next_bucket_relaxed();
             }
             root.unlock();
             for (k, v) in items {
@@ -622,24 +624,17 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         loop {
             let table = self.load_table();
             let idx = self.h1_mask(hash64, table.mask());
-            let root = unsafe { &*table.buckets().add(idx) };
+            let root = table.get_bucket(idx);
 
             root.lock();
 
             // Check if resize is in progress before proceeding (like Go version)
-            if self.resize_state.started.load(Ordering::Acquire) {
-                let new_table_ready = unsafe {
-                    if let Some(ref new_table) = *self.resize_state.new_table.get() {
-                        new_table.seq_init_done()
-                    } else {
-                        false
-                    }
-                };
-                if new_table_ready {
-                    root.unlock();
-                    self.help_copy_and_wait();
-                    continue; // Retry with new table
-                }
+            if self.resize_state.started.load(Ordering::Relaxed)
+                && self.resize_state.is_new_table_ready()
+            {
+                root.unlock();
+                self.help_copy_and_wait();
+                continue; // Retry with new table
             }
 
             // Check if table was swapped during lock acquisition
@@ -656,7 +651,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let h2w = broadcast(h2);
 
             'search_loop: loop {
-                let entries = unsafe { &*b.entries.get() };
+                let entries = b.get_entries();
                 let meta = b.meta.load(Ordering::Relaxed);
                 let mut marked = mark_zero_bytes(meta ^ h2w);
 
@@ -668,8 +663,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                     let entry = &entries[slot];
                     if entry.equal_hash(hash64) {
-                        let entry_key = unsafe { entry.key.assume_init_ref() };
-                        if entry_key == &key {
+                        if entry.get_key() == &key {
                             found_info = Some((b as *const _ as *mut _, slot));
                             break 'search_loop;
                         }
@@ -696,9 +690,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             return if let Some((bucket_ptr, slot)) = found_info {
                 // Key found - process existing entry
                 let bucket = unsafe { &*bucket_ptr };
-                let entries = unsafe { &mut *bucket.entries.get() };
+                let entries = bucket.get_entries_mut();
                 let entry = &mut entries[slot];
-                let old_val = unsafe { entry.val.assume_init_ref().clone() };
+                let old_val = entry.clone_value();
                 let (op, new_val) = f(Some(old_val.clone()));
 
                 match op {
@@ -758,12 +752,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                             if let Some((empty_bucket_ptr, empty_slot)) = empty_slot_info {
                                 // Insert into existing bucket with empty slot
                                 let empty_bucket = unsafe { &*empty_bucket_ptr };
-                                let entries = unsafe { &mut *empty_bucket.entries.get() };
+                                let entries = empty_bucket.get_entries_mut();
 
                                 // Prefill entry data before odd to shorten odd window (like Go)
-                                entries[empty_slot].set_hash(hash64);
-                                entries[empty_slot].key = MaybeUninit::new(key);
-                                entries[empty_slot].val = MaybeUninit::new(new_v.clone());
+                                entries[empty_slot].init_entry(hash64, key, new_v.clone());
                                 let meta = empty_bucket.meta.load(Ordering::Relaxed);
                                 let new_meta = set_byte(meta, h2, empty_slot);
 
@@ -780,7 +772,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 // Update counter
                                 table.add_size(idx, 1);
 
-                                self.maybe_resize_after_insert(&table);
                                 (None, Some(new_v))
                             } else {
                                 // Need to create new bucket - find the last bucket in chain
@@ -828,23 +819,16 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let table = self.load_table();
 
             for i in 0..(table.mask() + 1) {
-                let root = unsafe { &*table.buckets().add(i) };
+                let root = table.get_bucket(i);
                 root.lock();
 
                 // Check if resize is in progress and help complete the copy
-                if self.resize_state.started.load(Ordering::Acquire) {
-                    let new_table_ready = unsafe {
-                        if let Some(ref new_table) = *self.resize_state.new_table.get() {
-                            new_table.seq_init_done()
-                        } else {
-                            false
-                        }
-                    };
-                    if new_table_ready {
-                        root.unlock();
-                        self.help_copy_and_wait();
-                        continue 'restart; // Retry with new table
-                    }
+                if self.resize_state.started.load(Ordering::Relaxed)
+                    && self.resize_state.is_new_table_ready()
+                {
+                    root.unlock();
+                    self.help_copy_and_wait();
+                    continue 'restart; // Retry with new table
                 }
 
                 // Check if table has been swapped during resize
@@ -856,7 +840,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                 let mut b = root;
                 loop {
-                    let entries = unsafe { &mut *b.entries.get() };
+                    let entries = b.get_entries_mut();
                     let mut meta = b.meta.load(Ordering::Relaxed);
 
                     // Use meta-based iteration like Go version: for marked := meta & META_MASK; marked != 0; marked &= marked - 1
@@ -866,8 +850,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         let entry = &mut entries[j];
 
                         if entry.is_occupied() {
-                            let key = unsafe { entry.key.assume_init_ref() };
-                            let val = unsafe { entry.val.assume_init_ref() };
+                            let key = entry.get_key();
+                            let val = entry.get_value();
                             let (op, new_val) = f(key, val);
 
                             match op {
@@ -1054,7 +1038,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
         // Calculate chunk size
         let chunk_sz = (table_len + chunks as usize - 1) / chunks as usize;
-        let is_growth = (new_table.mask() + 1) > table_len;
+        // let is_growth = (new_table.mask() + 1) > table_len;
 
         // Work loop - similar to Go's for loop
         loop {
@@ -1081,7 +1065,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 new_table,
                 process0 as usize,
                 chunks as usize,
-                is_growth,
+                // is_growth,
             );
 
             // Mark chunk as completed
@@ -1115,7 +1099,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         new_table: &Table<K, V>,
         chunk_id: usize,
         total_chunks: usize,
-        is_growth: bool,
+        //is_growth: bool,
     ) where
         K: Clone + Eq + Hash,
         V: Clone,
@@ -1125,109 +1109,21 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let start = chunk_id * chunk_size;
         let end = std::cmp::min(start + chunk_size, old_len);
         let mut total_copied = 0;
-        if is_growth {
-            // Growth: only lock source buckets, not destination buckets
-            for i in start..end {
-                total_copied +=
-                    self.copy_bucket(unsafe { &*old_table.buckets().add(i) }, new_table);
-            }
-        } else {
-            // Shrink: lock both source and destination buckets
-            for i in start..end {
-                total_copied +=
-                    self.copy_bucket_lock(unsafe { &*old_table.buckets().add(i) }, new_table);
-            }
+        // if is_growth {
+        // Growth: only lock source buckets, not destination buckets
+        for i in start..end {
+            total_copied += self.copy_bucket(old_table.get_bucket(i), new_table);
         }
+        // } else {
+        //     // Shrink: lock both source and destination buckets
+        //     for i in start.end {
+        //         total_copied += self.copy_bucket_lock(old_table.get_bucket(i), new_table);
+        //     }
+        // }
         // Update size in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
             new_table.add_size(start, total_copied as isize);
         }
-    }
-
-    fn copy_bucket_lock(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
-    where
-        K: Clone + Eq + Hash,
-        V: Clone,
-    {
-        // Lock the source bucket to stabilize the chain
-        bucket.lock();
-
-        let mut copied = 0;
-        let mut current = bucket;
-        loop {
-            let entries_ref = unsafe { &*current.entries.get() };
-            let meta = current.meta.load(Ordering::Relaxed);
-            let mut marked = meta & META_MASK;
-
-            while marked != 0 {
-                let j = first_marked_byte_index(marked);
-                let entry = &entries_ref[j];
-
-                // Check if slot is marked as occupied and entry is occupied
-                if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
-                    let key = unsafe { entry.key.assume_init_ref().clone() };
-                    let val = unsafe { entry.val.assume_init_ref().clone() };
-                    //let (hash64, h2) = self.hash_pair(&key);
-                    let hash64 = entry.hash;
-                    let h2 = self.h2(hash64);
-
-                    // For shrink operations, lock destination bucket during insertion
-                    let idx = self.h1_mask(hash64, new_table.mask());
-                    let dest_bucket = unsafe { &*new_table.buckets().add(idx) };
-                    dest_bucket.lock();
-
-                    // Direct insertion into destination bucket (like Go's appendTo loop)
-                    let mut current_dest = dest_bucket;
-                    'append_to: loop {
-                        let dest_meta = current_dest.meta.load(Ordering::Relaxed);
-                        let empty = (!dest_meta) & META_MASK;
-
-                        if empty != 0 {
-                            // Found empty slot
-                            let empty_idx = first_marked_byte_index(empty);
-                            let new_meta = set_byte(dest_meta, h2, empty_idx);
-
-                            unsafe {
-                                // Follow Go's order: meta first, then value, hash, key
-                                current_dest.meta.store(new_meta, Ordering::Relaxed);
-                                let dest_entries = &mut *current_dest.entries.get();
-                                dest_entries[empty_idx].val.as_mut_ptr().write(val.clone());
-                                dest_entries[empty_idx].set_hash(hash64);
-                                dest_entries[empty_idx].key.as_mut_ptr().write(key.clone());
-                            }
-                            break 'append_to;
-                        }
-
-                        // No empty slot, check for next bucket
-                        let next_ptr = current_dest.next.load(Ordering::Relaxed);
-                        if next_ptr.is_null() {
-                            // Create new overflow bucket
-                            let new_bucket =
-                                Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
-                            let new_ptr = Box::into_raw(new_bucket);
-                            current_dest.next.store(new_ptr, Ordering::Relaxed);
-                            break 'append_to;
-                        } else {
-                            current_dest = unsafe { &*next_ptr };
-                        }
-                    }
-
-                    dest_bucket.unlock();
-                    copied += 1;
-                }
-                marked &= marked - 1;
-            }
-
-            // Move to next bucket in chain
-            let next_ptr = current.next.load(Ordering::Relaxed);
-            if next_ptr.is_null() {
-                break;
-            }
-            current = unsafe { &*next_ptr };
-        }
-
-        bucket.unlock();
-        copied
     }
 
     fn copy_bucket(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
@@ -1241,7 +1137,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let mut copied = 0;
         let mut current = bucket;
         loop {
-            let entries_ref = unsafe { &*current.entries.get() };
+            let entries_ref = current.get_entries();
             let meta = current.meta.load(Ordering::Relaxed);
             let mut marked = meta & META_MASK;
 
@@ -1251,15 +1147,14 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                 // Check if slot is marked as occupied and entry is occupied
                 if (meta >> (j * 8)) & SLOT_MASK != 0 && entry.is_occupied() {
-                    let key = unsafe { entry.key.assume_init_ref().clone() };
-                    let val = unsafe { entry.val.assume_init_ref().clone() };
+                    let (key, val) = entry.clone_key_value();
                     //let (hash64, h2) = self.hash_pair(&key);
                     let hash64 = entry.hash;
                     let h2 = self.h2(hash64);
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask());
-                    let dest_bucket = unsafe { &*new_table.buckets().add(idx) };
+                    let dest_bucket = new_table.get_bucket(idx);
                     //dest_bucket.lock();
 
                     // Direct insertion into destination bucket (like Go's appendTo loop)
@@ -1463,6 +1358,37 @@ impl<K, V> Bucket<K, V> {
         // Release root bucket lock by clearing the bit
         self.meta.fetch_and(!OP_LOCK_MASK, Ordering::Release);
     }
+
+    /// Safe entries access helpers
+    #[inline(always)]
+    fn get_entries(&self) -> &[Entry<K, V>; ENTRIES_PER_BUCKET] {
+        unsafe { &*self.entries.get() }
+    }
+
+    #[inline(always)]
+    fn get_entries_mut(&self) -> &mut [Entry<K, V>; ENTRIES_PER_BUCKET] {
+        unsafe { &mut *self.entries.get() }
+    }
+
+    #[inline(always)]
+    fn get_next_bucket(&self) -> Option<&Bucket<K, V>> {
+        let next_ptr = self.next.load(Ordering::Acquire);
+        if next_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*next_ptr })
+        }
+    }
+
+    #[inline(always)]
+    fn get_next_bucket_relaxed(&self) -> Option<&Bucket<K, V>> {
+        let next_ptr = self.next.load(Ordering::Relaxed);
+        if next_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*next_ptr })
+        }
+    }
 }
 
 impl<K, V> Table<K, V> {
@@ -1485,6 +1411,22 @@ impl<K, V> Table<K, V> {
     #[inline(always)]
     fn size_mask(&self) -> u32 {
         unsafe { *self.size_mask.get() }
+    }
+
+    /// Safe bucket access helpers
+    #[inline(always)]
+    fn get_bucket(&self, index: usize) -> &Bucket<K, V> {
+        unsafe { &*self.buckets().add(index) }
+    }
+
+    #[inline(always)]
+    fn get_bucket_mut(&self, index: usize) -> &mut Bucket<K, V> {
+        unsafe { &mut *self.buckets().add(index) }
+    }
+
+    #[inline(always)]
+    fn get_size_stripe(&self, index: usize) -> &AtomicUsize {
+        unsafe { &*self.size().add(index) }
     }
 
     /// SeqLoad performs a seqlock read of the table, similar to Go's flatTable.SeqLoad()
@@ -1528,20 +1470,16 @@ impl<K, V> Table<K, V> {
         self.seq.store(s + 2, Ordering::Release); // Make even (write complete)
     }
 
-    /// SeqInitDone checks if table initialization is complete, similar to Go's flatTable.SeqInitDone()
-    #[inline(always)]
-    fn seq_init_done(&self) -> bool {
-        self.seq.load(Ordering::Acquire) == 2
-    }
-
     /// AddSize adds delta to the size counter at the given index
     #[inline(always)]
     fn add_size(&self, idx: usize, delta: isize) {
         let stripe = idx & (self.size_mask() as usize);
         if delta > 0 {
-            unsafe { &*self.size().add(stripe) }.fetch_add(delta as usize, Ordering::Relaxed);
+            self.get_size_stripe(stripe)
+                .fetch_add(delta as usize, Ordering::Relaxed);
         } else {
-            unsafe { &*self.size().add(stripe) }.fetch_sub((-delta) as usize, Ordering::Relaxed);
+            self.get_size_stripe(stripe)
+                .fetch_sub((-delta) as usize, Ordering::Relaxed);
         }
     }
 
@@ -1550,7 +1488,7 @@ impl<K, V> Table<K, V> {
     fn sum_size(&self) -> usize {
         let mut sum = 0usize;
         for i in 0..=(self.size_mask() as usize) {
-            sum = sum.wrapping_add(unsafe { &*self.size().add(i) }.load(Ordering::Relaxed));
+            sum = sum.wrapping_add(self.get_size_stripe(i).load(Ordering::Relaxed));
         }
         sum
     }
@@ -1560,7 +1498,7 @@ impl<K, V> Table<K, V> {
     fn sum_size_exceeds(&self, limit: usize) -> bool {
         let mut sum = 0usize;
         for i in 0..=(self.size_mask() as usize) {
-            sum = sum.wrapping_add(unsafe { &*self.size().add(i) }.load(Ordering::Relaxed));
+            sum = sum.wrapping_add(self.get_size_stripe(i).load(Ordering::Relaxed));
             if sum > limit {
                 return true;
             }
@@ -1625,7 +1563,7 @@ impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
             // Clean up linked buckets first
             for i in 0..buckets_len {
                 unsafe {
-                    let bucket = &*self.table.buckets().add(i);
+                    let bucket = self.table.get_bucket(i);
                     let mut ptr = bucket.next.load(Ordering::Relaxed);
                     while !ptr.is_null() {
                         let next_ptr = (*ptr).next.load(Ordering::Relaxed);
@@ -1638,7 +1576,7 @@ impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
             // Drop buckets in place
             for i in 0..buckets_len {
                 unsafe {
-                    std::ptr::drop_in_place(self.table.buckets().add(i));
+                    std::ptr::drop_in_place(self.table.get_bucket_mut(i));
                 }
             }
 
@@ -1700,6 +1638,102 @@ impl<K, V> Entry<K, V> {
     fn clear(&mut self) {
         self.hash = 0; // Clear all bits including init flag
     }
+
+    /// Safe key access for occupied entries
+    #[inline(always)]
+    fn get_key(&self) -> &K {
+        debug_assert!(self.is_occupied(), "Entry must be occupied to access key");
+        unsafe { self.key.assume_init_ref() }
+    }
+
+    /// Safe value access for occupied entries
+    #[inline(always)]
+    fn get_value(&self) -> &V {
+        debug_assert!(self.is_occupied(), "Entry must be occupied to access value");
+        unsafe { self.val.assume_init_ref() }
+    }
+
+    // /// Safe cloned key access for occupied entries
+    // #[inline(always)]
+    // fn clone_key(&self) -> K
+    // where
+    //     K: Clone,
+    // {
+    //     debug_assert!(self.is_occupied(), "Entry must be occupied to clone key");
+    //     unsafe { self.key.assume_init_ref().clone() }
+    // }
+
+    /// Safe cloned value access for occupied entries
+    #[inline(always)]
+    fn clone_value(&self) -> V
+    where
+        V: Clone,
+    {
+        debug_assert!(self.is_occupied(), "Entry must be occupied to clone value");
+        unsafe { self.val.assume_init_ref().clone() }
+    }
+
+    /// Safe cloned key-value pair access for occupied entries
+    #[inline(always)]
+    fn clone_key_value(&self) -> (K, V)
+    where
+        K: Clone,
+        V: Clone,
+    {
+        debug_assert!(
+            self.is_occupied(),
+            "Entry must be occupied to clone key-value"
+        );
+        unsafe {
+            (
+                self.key.assume_init_ref().clone(),
+                self.val.assume_init_ref().clone(),
+            )
+        }
+    }
+
+    /// Unsafe clone for concurrent access - caller must ensure entry is occupied
+    #[inline(always)]
+    unsafe fn unsafe_clone_key_value(&self) -> (K, V)
+    where
+        K: Clone,
+        V: Clone,
+    {
+        (
+            self.key.assume_init_ref().clone(),
+            self.val.assume_init_ref().clone(),
+        )
+    }
+
+    /// Safe entry initialization
+    #[inline(always)]
+    fn init_entry(&mut self, hash: u64, key: K, value: V) {
+        self.set_hash(hash);
+        self.key = MaybeUninit::new(key);
+        self.val = MaybeUninit::new(value);
+    }
+
+    // /// Safe value update for occupied entries
+    // #[inline(always)]
+    // fn update_value(&mut self, new_value: V) {
+    //     debug_assert!(self.is_occupied(), "Entry must be occupied to update value");
+    //     unsafe {
+    //         std::ptr::drop_in_place(self.val.as_mut_ptr());
+    //         self.val = MaybeUninit::new(new_value);
+    //     }
+    // }
+
+    // /// Safe entry cleanup (drops key and value if occupied)
+    // #[inline(always)]
+    // fn cleanup(&mut self) {
+    //     if self.is_occupied() {
+    //         unsafe {
+    //             std::ptr::drop_in_place(self.key.as_mut_ptr());
+    //             std::ptr::drop_in_place(self.val.as_mut_ptr());
+    //         }
+    //         self.clear();
+    //     }
+    // }
 }
 
 // Provide idiomatic trait implementations to integrate with the Rust ecosystem.
