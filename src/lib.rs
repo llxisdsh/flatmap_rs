@@ -123,7 +123,7 @@ struct Table<K, V> {
     buckets: *mut Bucket<K, V>,
     mask: usize,
     size: *mut AtomicUsize,
-    size_mask: usize,
+    size_mask: u32,
 }
 
 #[repr(align(8))]
@@ -265,7 +265,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             buckets: buckets_ptr,
             mask: len - 1,
             size: size_ptr,
-            size_mask: size_len - 1,
+            size_mask: size_len as u32 - 1,
         };
         let table_ptr = Box::into_raw(Box::new(table));
         Self {
@@ -720,7 +720,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                         root.unlock();
                         // Update counter
-                        let stripe = idx & table.size_mask;
+                        let stripe = idx & (table.size_mask as usize);
                         unsafe { &*table.size.add(stripe) }.fetch_sub(1, Ordering::Relaxed);
                         // self.maybe_resize_after_remove(table);
                         (Some(old_val), None)
@@ -760,7 +760,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = idx & table.size_mask;
+                                let stripe = idx & (table.size_mask as usize);
                                 unsafe { &*table.size.add(stripe) }.fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
@@ -783,7 +783,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = idx & table.size_mask;
+                                let stripe = idx & (table.size_mask as usize);
                                 unsafe { &*table.size.add(stripe) }.fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
@@ -881,7 +881,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                     }
 
                                     // Decrement counter using bucket index like Go version
-                                    let stripe_idx = i & table.size_mask;
+                                    let stripe_idx = i & (table.size_mask as usize);
                                     unsafe { &*table.size.add(stripe_idx) }
                                         .fetch_sub(1, Ordering::Relaxed);
                                 }
@@ -945,7 +945,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     fn sum_size(&self, table: &Table<K, V>) -> usize {
         let mut s = 0usize;
         for i in 0..(table.size_mask + 1) {
-            let c = unsafe { &*table.size.add(i) }.load(Ordering::Relaxed);
+            let c = unsafe { &*table.size.add(i as usize) }.load(Ordering::Relaxed);
             s = s.wrapping_add(c);
         }
         s
@@ -1126,7 +1126,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
         // Update size in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
-            let stripe = start & new_table.size_mask;
+            let stripe = start & (new_table.size_mask as usize);
             unsafe { &*new_table.size.add(stripe) }.fetch_add(total_copied, Ordering::Relaxed);
         }
     }
@@ -1361,7 +1361,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             buckets,
             mask: new_len - 1,
             size,
-            size_mask: size_len - 1,
+            size_mask: (size_len - 1) as u32,
         });
 
         if unsafe { *state.hint.get() } == ResizeHint::Clear {
@@ -1547,7 +1547,7 @@ impl<K, V> Drop for Table<K, V> {
         }
 
         if !self.size.is_null() {
-            let size_len = self.size_mask + 1;
+            let size_len = self.size_mask as usize + 1;
 
             // AtomicUsize doesn't need drop_in_place, just deallocate memory
             unsafe {
