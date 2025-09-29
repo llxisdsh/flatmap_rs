@@ -89,7 +89,10 @@ impl<K, V> ResizeState<K, V> {
         // Use chunks as the publication barrier for new_table.
         // finalize_resize publishes new_table before storing chunks with Release,
         // so an Acquire load of chunks ensures visibility of new_table.
-        let _ = self.chunks.load(Ordering::Acquire);
+        let chunks = self.chunks.load(Ordering::Acquire);
+        if chunks == 0 {
+            return false;
+        }
         unsafe {
             if let Some(ref new_table) = *self.new_table.get() {
                 new_table.seq.load(Ordering::Acquire) == 2
@@ -643,8 +646,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Check if table was swapped during lock acquisition
-            let current_table = self.table.seq_load();
-            if table.buckets() != current_table.buckets() {
+            if unsafe { *table.seq.as_ptr() } != self.table.seq.load(Ordering::Relaxed) {
                 root.unlock();
                 continue; // Retry with new table
             }
@@ -837,8 +839,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
 
                 // Check if table has been swapped during resize
-                let current_table = self.table.seq_load();
-                if table.buckets() != current_table.buckets() {
+                if unsafe { *table.seq.as_ptr() } != self.table.seq.load(Ordering::Relaxed) {
                     root.unlock();
                     continue 'restart; // Retry with new table
                 }
@@ -948,7 +949,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
-        if self.resize_state.started.load(Ordering::Acquire) {
+        if self.resize_state.started.load(Ordering::Relaxed) {
             return;
         }
         let cap = (table.mask() + 1) * ENTRIES_PER_BUCKET;
@@ -1035,6 +1036,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // Get chunks first as an Acquire barrier to ensure visibility of new_table
         let chunks = state.chunks.load(Ordering::Acquire);
 
+        // If chunks is 0, the resize hasn't been properly initialized yet
+        if chunks == 0 {
+            return;
+        }
+
         // Get new table from state after the barrier
         let new_table_opt = unsafe { &*state.new_table.get() };
         let new_table = match new_table_opt {
@@ -1049,7 +1055,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // Work loop - similar to Go's for loop
         loop {
             // fetch_add returns the previous value, so we need to add 1 to get the current process number
-            let process_prev = state.process.fetch_add(1, Ordering::AcqRel);
+            let process_prev = state.process.fetch_add(1, Ordering::Relaxed);
             if process_prev >= chunks {
                 // No more work, wait for completion
                 while state.started.load(Ordering::Acquire) {
@@ -1093,6 +1099,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 unsafe {
                     *state.new_table.get() = None;
                 }
+                state.chunks.store(0, Ordering::Release);
                 state.started.store(false, Ordering::Release);
                 return;
             }
@@ -1447,7 +1454,7 @@ impl<K, V> Table<K, V> {
                     mask: UnsafeCell::new(self.mask()),
                     size: UnsafeCell::new(self.size()),
                     size_mask: UnsafeCell::new(self.size_mask()),
-                    seq: AtomicU32::new(0), // Don't copy the atomic, create new
+                    seq: AtomicU32::new(s1),
                 };
                 let s2 = self.seq.load(Ordering::Acquire);
                 if s1 == s2 {
