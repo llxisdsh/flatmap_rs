@@ -776,7 +776,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 // Update counter
                                 table.add_size(idx, 1);
 
-                                self.maybe_resize_after_insert(&table);
+                                self.maybe_grow(&table);
                                 (None, Some(new_v))
                             }
                         } else {
@@ -914,7 +914,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 
     #[inline(always)]
-    fn maybe_resize_after_insert(&self, table: &Table<K, V>) {
+    fn maybe_grow(&self, table: &Table<K, V>) {
         if self.resize_state.started.load(Ordering::Relaxed) {
             return;
         }
@@ -973,6 +973,98 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 // }
             }
         }
+    }
+
+    fn finalize_resize(&self) {
+        // This method corresponds to Go's finalizeResize function
+        // It creates the new table and initiates the copy process
+        let state = &self.resize_state;
+        let old_table = self.table.seq_load();
+        let old_len = old_table.mask() + 1;
+
+        // Calculate new table length based on resize hint
+        let new_len = match unsafe { &*state.hint.get() } {
+            ResizeHint::Grow => old_len * 2,
+            ResizeHint::Shrink => {
+                if old_len <= MIN_TABLE_LEN {
+                    // Should not happen, but handle gracefully
+                    state.started.store(false, Ordering::Release);
+                    return;
+                }
+                old_len / 2
+            }
+            ResizeHint::Clear => MIN_TABLE_LEN,
+        };
+
+        // Calculate parallelism for the copy operation
+        let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get());
+
+        // Create the new table (this is where the actual allocation happens)
+        let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(new_len).unwrap();
+        let buckets = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
+        if buckets.is_null() {
+            std::alloc::handle_alloc_error(buckets_layout);
+        }
+
+        // Initialize buckets
+        for i in 0..new_len {
+            unsafe {
+                std::ptr::write(buckets.add(i), Bucket::new());
+            }
+        }
+
+        // Allocate and initialize size
+        let size_len = calc_size_len(new_len, num_cpus::get());
+        let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
+        let size = unsafe { std::alloc::alloc(size_layout) as *mut AtomicUsize };
+        if size.is_null() {
+            std::alloc::handle_alloc_error(size_layout);
+        }
+
+        // Initialize size
+        for i in 0..size_len {
+            unsafe {
+                std::ptr::write(size.add(i), AtomicUsize::new(0));
+            }
+        }
+
+        let new_table = Table {
+            buckets: UnsafeCell::new(buckets),
+            mask: UnsafeCell::new(new_len - 1),
+            size: UnsafeCell::new(size),
+            size_mask: UnsafeCell::new((size_len - 1) as u32),
+            seq: AtomicU32::new(2), // Set to 2 to indicate initialization is complete
+        };
+
+        if unsafe { *state.hint.get() } == ResizeHint::Clear {
+            // Store old table for cleanup
+            let old_table_copy = self.table.seq_load();
+            unsafe {
+                let old_tables = &mut *self.old_tables.get();
+                old_tables.push(Box::new(old_table_copy));
+            }
+
+            // Swap to new empty table using seqlock
+            self.table.seq_store(&new_table);
+
+            // Clear resize state
+            state.started.store(false, Ordering::Release);
+
+            return;
+        }
+
+        // Store new table first, then publish via chunks with Release
+        unsafe {
+            *state.new_table.get() = Some(new_table);
+        }
+        state.chunks.store(chunks as i32, Ordering::Release);
+
+        // Now call help_copy_and_wait to perform the actual data copying
+        // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
+        self.help_copy_and_wait();
+
+        // Note: help_copy_and_wait handles table swap and resize_state cleanup
+        // The resize state will be cleaned up by the thread that completes the last chunk
     }
 
     fn help_copy_and_wait(&self) {
@@ -1163,98 +1255,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
         bucket.unlock();
         copied
-    }
-
-    fn finalize_resize(&self) {
-        // This method corresponds to Go's finalizeResize function
-        // It creates the new table and initiates the copy process
-        let state = &self.resize_state;
-        let old_table = self.table.seq_load();
-        let old_len = old_table.mask() + 1;
-
-        // Calculate new table length based on resize hint
-        let new_len = match unsafe { &*state.hint.get() } {
-            ResizeHint::Grow => old_len * 2,
-            ResizeHint::Shrink => {
-                if old_len <= MIN_TABLE_LEN {
-                    // Should not happen, but handle gracefully
-                    state.started.store(false, Ordering::Release);
-                    return;
-                }
-                old_len / 2
-            }
-            ResizeHint::Clear => MIN_TABLE_LEN,
-        };
-
-        // Calculate parallelism for the copy operation
-        let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get());
-
-        // Create the new table (this is where the actual allocation happens)
-        let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(new_len).unwrap();
-        let buckets = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
-        if buckets.is_null() {
-            std::alloc::handle_alloc_error(buckets_layout);
-        }
-
-        // Initialize buckets
-        for i in 0..new_len {
-            unsafe {
-                std::ptr::write(buckets.add(i), Bucket::new());
-            }
-        }
-
-        // Allocate and initialize size
-        let size_len = calc_size_len(new_len, num_cpus::get());
-        let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
-        let size = unsafe { std::alloc::alloc(size_layout) as *mut AtomicUsize };
-        if size.is_null() {
-            std::alloc::handle_alloc_error(size_layout);
-        }
-
-        // Initialize size
-        for i in 0..size_len {
-            unsafe {
-                std::ptr::write(size.add(i), AtomicUsize::new(0));
-            }
-        }
-
-        let new_table = Table {
-            buckets: UnsafeCell::new(buckets),
-            mask: UnsafeCell::new(new_len - 1),
-            size: UnsafeCell::new(size),
-            size_mask: UnsafeCell::new((size_len - 1) as u32),
-            seq: AtomicU32::new(2), // Set to 2 to indicate initialization is complete
-        };
-
-        if unsafe { *state.hint.get() } == ResizeHint::Clear {
-            // Store old table for cleanup
-            let old_table_copy = self.table.seq_load();
-            unsafe {
-                let old_tables = &mut *self.old_tables.get();
-                old_tables.push(Box::new(old_table_copy));
-            }
-
-            // Swap to new empty table using seqlock
-            self.table.seq_store(&new_table);
-
-            // Clear resize state
-            state.started.store(false, Ordering::Release);
-
-            return;
-        }
-
-        // Store new table first, then publish via chunks with Release
-        unsafe {
-            *state.new_table.get() = Some(new_table);
-        }
-        state.chunks.store(chunks as i32, Ordering::Release);
-
-        // Now call help_copy_and_wait to perform the actual data copying
-        // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
-        self.help_copy_and_wait();
-
-        // Note: help_copy_and_wait handles table swap and resize_state cleanup
-        // The resize state will be cleaned up by the thread that completes the last chunk
     }
 }
 
