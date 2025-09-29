@@ -54,6 +54,7 @@ fn calc_size_len(table_len: usize, cpus: usize) -> usize {
     next_pow2(cpus.min(table_len >> 10))
 }
 
+#[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ResizeHint {
     Grow,
@@ -63,28 +64,32 @@ enum ResizeHint {
 
 // Parallel resize state structure (corresponds to Go's flatResizeState)
 struct ResizeState<K, V> {
-    new_table: UnsafeCell<Option<Table<K, V>>>, // Protected by started flag
-    chunks: AtomicI32,                          // Set by finalizeResize
-    process: AtomicI32,                         // Atomic counter for work distribution
-    completed: AtomicI32,                       // Atomic counter for completed chunks
     started: AtomicBool,                        // Whether resize has started
     hint: UnsafeCell<ResizeHint>,               // Resize operation type (protected by started)
+    chunks: AtomicI32,                          // Set by finalizeResize
+    new_table: UnsafeCell<Option<Table<K, V>>>, // Protected by started flag
+    process: AtomicI32,                         // Atomic counter for work distribution
+    completed: AtomicI32,                       // Atomic counter for completed chunks
 }
 
 impl<K, V> ResizeState<K, V> {
     pub fn new() -> Self {
         Self {
-            new_table: UnsafeCell::new(None),
-            chunks: AtomicI32::new(0),
-            process: AtomicI32::new(0),
-            completed: AtomicI32::new(0),
             started: AtomicBool::new(false),
             hint: UnsafeCell::new(ResizeHint::Grow),
+            chunks: AtomicI32::new(0),
+            new_table: UnsafeCell::new(None),
+            process: AtomicI32::new(0),
+            completed: AtomicI32::new(0),
         }
     }
 
     #[inline(always)]
     pub fn is_new_table_ready(&self) -> bool {
+        // Use chunks as the publication barrier for new_table.
+        // finalize_resize publishes new_table before storing chunks with Release,
+        // so an Acquire load of chunks ensures visibility of new_table.
+        let _ = self.chunks.load(Ordering::Acquire);
         unsafe {
             if let Some(ref new_table) = *self.new_table.get() {
                 new_table.seq.load(Ordering::Acquire) == 2
@@ -639,7 +644,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
             // Check if table was swapped during lock acquisition
             let current_table = self.table.seq_load();
-            if table.seq.load(Ordering::Relaxed) != current_table.seq.load(Ordering::Relaxed) {
+            if table.buckets() != current_table.buckets() {
                 root.unlock();
                 continue; // Retry with new table
             }
@@ -1027,13 +1032,15 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let old_table = self.table.seq_load();
         let table_len = old_table.mask() + 1;
 
-        // Get new table and chunks from state
+        // Get chunks first as an Acquire barrier to ensure visibility of new_table
+        let chunks = state.chunks.load(Ordering::Acquire);
+
+        // Get new table from state after the barrier
         let new_table_opt = unsafe { &*state.new_table.get() };
         let new_table = match new_table_opt {
             Some(ref table) => table,
             None => return, // New table not ready yet
         };
-        let chunks = state.chunks.load(Ordering::Acquire);
 
         // Calculate chunk size
         let chunk_sz = (table_len + chunks as usize - 1) / chunks as usize;
@@ -1289,11 +1296,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             return;
         }
 
-        // Store chunks and new table in the resize state
-        state.chunks.store(chunks as i32, Ordering::Release);
+        // Store new table first, then publish via chunks with Release
         unsafe {
             *state.new_table.get() = Some(new_table);
         }
+        state.chunks.store(chunks as i32, Ordering::Release);
 
         // Now call help_copy_and_wait to perform the actual data copying
         // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
