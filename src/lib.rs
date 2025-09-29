@@ -681,10 +681,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                 while marked != 0 {
                     let slot = first_marked_byte_index(marked);
-                    if slot >= ENTRIES_PER_BUCKET {
-                        break;
-                    }
-
                     let entry = &entries[slot];
                     if entry.equal_hash(hash64) {
                         if entry.get_key() == &key {
