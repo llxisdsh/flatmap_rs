@@ -47,54 +47,6 @@ const RESIZE_OVER_PARTITION: usize = 4;
 const SPIN_BEFORE_YIELD: i32 = 128;
 
 // ================================================================================================
-// UTILITY FUNCTIONS
-// ================================================================================================
-
-/// Calculate the next power of 2 greater than or equal to n
-fn next_pow2(mut n: usize) -> usize {
-    if n < 2 {
-        return 2;
-    }
-    n -= 1;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    if usize::BITS == 64 {
-        n |= n >> 32;
-    }
-    n + 1
-}
-
-/// Calculate table length based on size hint
-fn calc_table_len(size_hint: usize) -> usize {
-    let min_cap = (size_hint as f64 * (1.0 / (ENTRIES_PER_BUCKET as f64 * LOAD_FACTOR))) as usize;
-    let base = min_cap.max(MIN_TABLE_LEN);
-    next_pow2(base)
-}
-
-/// Calculate size array length based on table length and CPU count
-fn calc_size_len(table_len: usize, cpus: usize) -> usize {
-    next_pow2(cpus.min(table_len >> 10))
-}
-
-/// Calculate parallelism for resize operations
-fn calc_parallelism(
-    table_len: usize,
-    min_buckets_per_cpu: usize,
-    max_cpus: usize,
-) -> (usize, usize) {
-    let cpus = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
-    let max_workers = over_cpus.min(max_cpus);
-    let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
-    (max_workers, chunks)
-}
-
-// ================================================================================================
 // CORE TYPES AND ENUMS
 // ================================================================================================
 
@@ -1662,53 +1614,6 @@ impl<K, V> Entry<K, V> {
 }
 
 // ================================================================================================
-// UTILITY FUNCTIONS FOR BIT MANIPULATION
-// ================================================================================================
-
-#[inline(always)]
-fn broadcast(b: u8) -> u64 {
-    (b as u64) * 0x0101_0101_0101_0101
-}
-
-#[inline(always)]
-fn first_marked_byte_index(w: u64) -> usize {
-    (w.trailing_zeros() >> 3) as usize
-}
-
-#[inline(always)]
-fn mark_zero_bytes(w: u64) -> u64 {
-    (w.wrapping_sub(0x0101_0101_0101_0101)) & (!w) & META_MASK
-}
-
-#[inline(always)]
-fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
-    let shift = (idx as u64) << 3;
-    (w & !(0xffu64 << shift)) | ((b as u64) << shift)
-}
-
-#[inline(always)]
-fn try_spin(spins: &mut i32) -> bool {
-    if *spins < SPIN_BEFORE_YIELD {
-        *spins += *spins + 1;
-        std::hint::spin_loop();
-        true
-    } else {
-        false
-    }
-}
-
-#[inline(always)]
-fn delay(spins: &mut i32) {
-    if *spins < SPIN_BEFORE_YIELD {
-        *spins += *spins + 1;
-        std::hint::spin_loop();
-    } else {
-        *spins = 0;
-        thread::yield_now();
-    }
-}
-
-// ================================================================================================
 // STANDALONE ITERATOR FUNCTION
 // ================================================================================================
 
@@ -1827,5 +1732,96 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Extend<(K, V)> fo
         for (k, v) in iter {
             let _ = self.insert(k, v);
         }
+    }
+}
+
+// ================================================================================================
+// UTILITY FUNCTIONS
+// ================================================================================================
+
+/// Calculate the next power of 2 greater than or equal to n
+fn next_pow2(mut n: usize) -> usize {
+    if n < 2 {
+        return 2;
+    }
+    n -= 1;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    if usize::BITS == 64 {
+        n |= n >> 32;
+    }
+    n + 1
+}
+
+/// Calculate table length based on size hint
+fn calc_table_len(size_hint: usize) -> usize {
+    let min_cap = (size_hint as f64 * (1.0 / (ENTRIES_PER_BUCKET as f64 * LOAD_FACTOR))) as usize;
+    let base = min_cap.max(MIN_TABLE_LEN);
+    next_pow2(base)
+}
+
+/// Calculate size array length based on table length and CPU count
+fn calc_size_len(table_len: usize, cpus: usize) -> usize {
+    next_pow2(cpus.min(table_len >> 10))
+}
+
+/// Calculate parallelism for resize operations
+fn calc_parallelism(
+    table_len: usize,
+    min_buckets_per_cpu: usize,
+    max_cpus: usize,
+) -> (usize, usize) {
+    let cpus = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
+    let max_workers = over_cpus.min(max_cpus);
+    let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
+    (max_workers, chunks)
+}
+
+#[inline(always)]
+fn broadcast(b: u8) -> u64 {
+    (b as u64) * 0x0101_0101_0101_0101
+}
+
+#[inline(always)]
+fn first_marked_byte_index(w: u64) -> usize {
+    (w.trailing_zeros() >> 3) as usize
+}
+
+#[inline(always)]
+fn mark_zero_bytes(w: u64) -> u64 {
+    (w.wrapping_sub(0x0101_0101_0101_0101)) & (!w) & META_MASK
+}
+
+#[inline(always)]
+fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
+    let shift = (idx as u64) << 3;
+    (w & !(0xffu64 << shift)) | ((b as u64) << shift)
+}
+
+#[inline(always)]
+fn try_spin(spins: &mut i32) -> bool {
+    if *spins < SPIN_BEFORE_YIELD {
+        *spins += *spins + 1;
+        std::hint::spin_loop();
+        true
+    } else {
+        false
+    }
+}
+
+#[inline(always)]
+fn delay(spins: &mut i32) {
+    if *spins < SPIN_BEFORE_YIELD {
+        *spins += *spins + 1;
+        std::hint::spin_loop();
+    } else {
+        *spins = 0;
+        thread::yield_now();
     }
 }
