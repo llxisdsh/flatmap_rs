@@ -1,33 +1,53 @@
 //! FlatMap: a high-performance flat hash map using per-bucket seqlock, ported from Go's pb.FlatMapOf.
 //! Simplified, Rust-idiomatic API focused on speed.
 
-// use std::hash::BuildHasherDefault;
+use std::cell::UnsafeCell;
+use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
-use std::cell::UnsafeCell;
-use std::hash::{BuildHasher, Hash};
-
 use ahash::RandomState;
-const ENTRIES_PER_BUCKET: usize = 7; // op byte = highest, keep 7 data bytes like Go (opByteIdx=7)
+
+// ================================================================================================
+// CONSTANTS
+// ================================================================================================
+
+/// Number of entries per bucket (op byte = highest, keep 7 data bytes like Go)
+const ENTRIES_PER_BUCKET: usize = 7;
+
+/// Mask for identifying occupied slots in meta bytes
 const META_MASK: u64 = 0x0080_8080_8080_8080;
+
+/// Value indicating an empty slot
 const EMPTY_SLOT: u8 = 0;
-const SLOT_MASK: u64 = 0x80; // mark a bit in meta byte as slot marker
+
+/// Mask for marking a bit in meta byte as slot marker
+const SLOT_MASK: u64 = 0x80;
+
+/// Load factor for determining when to resize
 const LOAD_FACTOR: f64 = 0.75;
-// Frequent hash table resizing (both expansion and contraction) results in an accumulation
-// of old tables, ultimately leading to increased memory occupancy.
-// This capability has been temporarily disabled to prevent memory issues.
-// const SHRINK_FRACTION: usize = 8;
+
+/// Minimum table length
 const MIN_TABLE_LEN: usize = 32;
-const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000; // highest meta byte's 0x80 bit acts as root lock
+
+/// Mask for the operation lock (highest meta byte's 0x80 bit acts as root lock)
+const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000;
 
 // Parallel resize constants
-const MIN_BUCKETS_PER_CPU: usize = 64; // Minimum buckets per CPU thread
-const RESIZE_OVER_PARTITION: usize = 4; // Over-partition factor for resize
+/// Minimum buckets per CPU thread
+const MIN_BUCKETS_PER_CPU: usize = 64;
 
+/// Over-partition factor for resize to reduce tail latency
+const RESIZE_OVER_PARTITION: usize = 4;
+
+// ================================================================================================
+// UTILITY FUNCTIONS
+// ================================================================================================
+
+/// Calculate the next power of 2 greater than or equal to n
 fn next_pow2(mut n: usize) -> usize {
     if n < 2 {
         return 2;
@@ -44,16 +64,49 @@ fn next_pow2(mut n: usize) -> usize {
     n + 1
 }
 
+/// Calculate table length based on size hint
 fn calc_table_len(size_hint: usize) -> usize {
     let min_cap = (size_hint as f64 * (1.0 / (ENTRIES_PER_BUCKET as f64 * LOAD_FACTOR))) as usize;
     let base = min_cap.max(MIN_TABLE_LEN);
     next_pow2(base)
 }
 
+/// Calculate size array length based on table length and CPU count
 fn calc_size_len(table_len: usize, cpus: usize) -> usize {
     next_pow2(cpus.min(table_len >> 10))
 }
 
+/// Calculate parallelism for resize operations
+fn calc_parallelism(
+    table_len: usize,
+    min_buckets_per_cpu: usize,
+    max_cpus: usize,
+) -> (usize, usize) {
+    let cpus = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
+    let max_workers = over_cpus.min(max_cpus);
+    let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
+    (max_workers, chunks)
+}
+
+// ================================================================================================
+// CORE TYPES AND ENUMS
+// ================================================================================================
+
+/// Operation type for Process and RangeProcess methods
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Op {
+    /// Cancel the operation, leaving the entry unchanged
+    Cancel,
+    /// Update the entry with the new value
+    Update,
+    /// Delete the entry from the map
+    Delete,
+}
+
+/// Resize hint for indicating the type of resize operation
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ResizeHint {
@@ -61,8 +114,65 @@ enum ResizeHint {
     Shrink,
     Clear,
 }
+// ================================================================================================
+// INTERNAL DATA STRUCTURES
+// ================================================================================================
 
-// Parallel resize state structure (corresponds to Go's flatResizeState)
+/// Entry in a bucket containing hash, key, and value
+struct Entry<K, V> {
+    hash: u64, // Highest bit indicates if entry is initialized, remaining 63 bits are actual hash
+    key: MaybeUninit<K>,
+    val: MaybeUninit<V>,
+}
+
+impl<K, V> Default for Entry<K, V> {
+    fn default() -> Self {
+        Self {
+            hash: 0, // 0 indicates empty slot (no HASH_INIT_FLAG)
+            key: MaybeUninit::uninit(),
+            val: MaybeUninit::uninit(),
+        }
+    }
+}
+
+/// Bucket containing entries and metadata for concurrent access
+#[repr(align(8))]
+struct Bucket<K, V> {
+    seq: AtomicU64,
+    meta: AtomicU64,
+    next: AtomicPtr<Bucket<K, V>>, // was: UnsafeCell<Option<Box<Bucket<K, V>>>>
+    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>,
+}
+
+// SAFETY: We provide per-bucket seqlock (seq) and atomic meta updates, and never move buckets after creation.
+// Concurrent access is coordinated via lock()/unlock() and Acquire/Release fences.
+unsafe impl<K: Send, V: Send> Send for Bucket<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for Bucket<K, V> {}
+
+/// Table containing buckets and size information
+struct Table<K, V> {
+    buckets: UnsafeCell<*mut Bucket<K, V>>,
+    mask: UnsafeCell<usize>,
+    size: UnsafeCell<*mut AtomicUsize>,
+    size_mask: UnsafeCell<u32>,
+    seq: AtomicU32, // seqlock for table (even=stable, odd=write)
+}
+
+impl<K, V> Clone for Table<K, V> {
+    fn clone(&self) -> Self {
+        unsafe {
+            Self {
+                buckets: UnsafeCell::new(*self.buckets.get()),
+                mask: UnsafeCell::new(*self.mask.get()),
+                size: UnsafeCell::new(*self.size.get()),
+                size_mask: UnsafeCell::new(*self.size_mask.get()),
+                seq: AtomicU32::new(self.seq.load(Ordering::Relaxed)),
+            }
+        }
+    }
+}
+
+/// Parallel resize state structure (corresponds to Go's flatResizeState)
 struct ResizeState<K, V> {
     started: AtomicBool,                        // Whether resize has started
     hint: UnsafeCell<ResizeHint>,               // Resize operation type (protected by started)
@@ -111,26 +221,15 @@ impl<K, V> Drop for ResizeState<K, V> {
     }
 }
 
-// Calculate parallelism for resize operations
-fn calc_parallelism(
-    table_len: usize,
-    min_buckets_per_cpu: usize,
-    max_cpus: usize,
-) -> (usize, usize) {
-    let cpus = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
-    let max_workers = over_cpus.min(max_cpus);
-    let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
-    (max_workers, chunks)
-}
+// ================================================================================================
+// MAIN FLATMAP STRUCTURE
+// ================================================================================================
 
+/// High-performance flat hash map using per-bucket seqlock
 pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
     table: Table<K, V>,
     old_tables: UnsafeCell<Vec<Box<Table<K, V>>>>,
     resize_state: ResizeState<K, V>,
-    // shrink_on: bool,
     hasher: S,
 }
 
@@ -139,99 +238,9 @@ pub struct FlatMap<K, V, S: BuildHasher = RandomState> {
 unsafe impl<K: Send, V: Send, S: Send + BuildHasher> Send for FlatMap<K, V, S> {}
 unsafe impl<K: Sync, V: Sync, S: Sync + BuildHasher> Sync for FlatMap<K, V, S> {}
 
-struct Table<K, V> {
-    buckets: UnsafeCell<*mut Bucket<K, V>>,
-    mask: UnsafeCell<usize>,
-    size: UnsafeCell<*mut AtomicUsize>,
-    size_mask: UnsafeCell<u32>,
-    seq: AtomicU32, // seqlock for table (even=stable, odd=write)
-}
-
-impl<K, V> Clone for Table<K, V> {
-    fn clone(&self) -> Self {
-        unsafe {
-            Self {
-                buckets: UnsafeCell::new(*self.buckets.get()),
-                mask: UnsafeCell::new(*self.mask.get()),
-                size: UnsafeCell::new(*self.size.get()),
-                size_mask: UnsafeCell::new(*self.size_mask.get()),
-                seq: AtomicU32::new(self.seq.load(Ordering::Relaxed)),
-            }
-        }
-    }
-}
-
-#[repr(align(8))]
-struct Bucket<K, V> {
-    seq: AtomicU64,
-    meta: AtomicU64,
-    next: AtomicPtr<Bucket<K, V>>, // was: UnsafeCell<Option<Box<Bucket<K, V>>>>
-    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>,
-}
-
-// SAFETY: We provide per-bucket seqlock (seq) and atomic meta updates, and never move buckets after creation.
-// Concurrent access is coordinated via lock()/unlock() and Acquire/Release fences.
-unsafe impl<K: Send, V: Send> Send for Bucket<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for Bucket<K, V> {}
-
-struct Entry<K, V> {
-    hash: u64, // Highest bit indicates if entry is initialized, remaining 63 bits are actual hash
-    key: MaybeUninit<K>,
-    val: MaybeUninit<V>,
-}
-
-impl<K, V> Default for Entry<K, V> {
-    fn default() -> Self {
-        Self {
-            hash: 0, // 0 indicates empty slot (no HASH_INIT_FLAG)
-            key: MaybeUninit::uninit(),
-            val: MaybeUninit::uninit(),
-        }
-    }
-}
-
-/// Operation type for Process and RangeProcess methods
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Op {
-    /// Cancel the operation, leaving the entry unchanged
-    Cancel,
-    /// Update the entry with the new value
-    Update,
-    /// Delete the entry from the map
-    Delete,
-}
-
-impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
-    fn clone(&self) -> Self {
-        // shallow clone meta/seq, deep-copy entries, ignore next for table swap simplicity
-        let mut entries_arr: [Entry<K, V>; ENTRIES_PER_BUCKET] =
-            std::array::from_fn(|_| Entry::default());
-        let src_entries = unsafe { &*self.entries.get() };
-        let meta = self.meta.load(Ordering::Relaxed);
-        let mut marked = meta & META_MASK;
-        while marked != 0 {
-            let j = first_marked_byte_index(marked);
-            entries_arr[j].hash = src_entries[j].hash; // Copy the full hash including init flag
-            unsafe {
-                entries_arr[j]
-                    .key
-                    .as_mut_ptr()
-                    .write((*src_entries[j].key.assume_init_ref()).clone());
-                entries_arr[j]
-                    .val
-                    .as_mut_ptr()
-                    .write((*src_entries[j].val.assume_init_ref()).clone());
-            }
-            marked &= marked - 1;
-        }
-        Bucket {
-            seq: AtomicU64::new(0), // Reset seq for new bucket
-            meta: AtomicU64::new(meta),
-            next: AtomicPtr::new(std::ptr::null_mut()), // reset chain; will be rebuilt on resize path
-            entries: UnsafeCell::new(entries_arr),
-        }
-    }
-}
+// ================================================================================================
+// FLATMAP CONSTRUCTORS
+// ================================================================================================
 
 impl<K: Eq + Hash + Clone, V: Clone> FlatMap<K, V, RandomState> {
     /// Create a new FlatMap with default settings.
@@ -311,28 +320,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             hasher,
         }
     }
-    //
-    // /// Enable or disable shrinking in-place and return a mutable reference to self.
-    // ///
-    // /// This method is intended for builder-like ergonomics when configuring the map after
-    // /// construction.
-    // /// Enable or disable in-place shrinking and return the map by value.
-    // ///
-    // /// This builder-style method consumes `self` and returns it, making it convenient to chain
-    // /// with temporary values like `FlatMap::new().set_shrink(true)`.
-    // pub fn set_shrink(mut self, enable: bool) -> Self {
-    //     self.shrink_on = enable;
-    //     self
-    // }
-    //
-    // /// Enable or disable in-place shrinking in place and return a mutable reference.
-    // ///
-    // /// This variant does not consume `self` and is useful when you hold the map in a mutable
-    // /// binding and want to configure it without moving.
-    // pub fn set_shrink_mut(&mut self, enable: bool) -> &mut Self {
-    //     self.shrink_on = enable;
-    //     self
-    // }
+
+    // ============================================================================================
+    // PUBLIC API METHODS
+    // ============================================================================================
 
     /// Check whether the given key is present.
     ///
@@ -610,6 +601,32 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         vals.into_iter()
     }
 
+    /// Returns the number of key-value pairs in the map.
+    pub fn len(&self) -> usize {
+        let table = self.table.seq_load();
+        table.sum_size()
+    }
+
+    /// Returns true if the map contains no elements.
+    pub fn is_empty(&self) -> bool {
+        let table = self.table.seq_load();
+        !table.sum_size_exceeds(0)
+    }
+
+    /// Removes all key-value pairs from the map.
+    pub fn clear(&self) {
+        self.try_resize(ResizeHint::Clear);
+    }
+
+    // ============================================================================================
+    // ADVANCED API METHODS
+    // ============================================================================================
+
+    /// Process a key with a user-defined function that can read, update, or delete the entry.
+    ///
+    /// The function receives the current value (if any) and returns an operation and optional new value.
+    /// Returns a tuple of (old_value, new_value) where old_value is the previous value (if any)
+    /// and new_value is the value that was set (if any).
     /// Process applies a compute-style update to a specific key.
     /// The function `f` receives the current value (if any) and returns an Op and new value.
     /// Returns (old_value, new_value) where old_value is the previous value if any.
@@ -813,10 +830,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
     }
 
-    /// RangeProcess iterates through all entries in the map and applies the function `f` to each.
-    /// The function can return Op to modify or delete entries.
-    /// This method blocks all other operations on the map during execution.
-    /// Uses meta-based iteration like Go version and processes entries in-lock.
+    /// Process all key-value pairs in the map with a user-defined function.
+    ///
+    /// The function receives references to each key and value and returns an operation and optional new value.
+    /// This method locks each bucket during processing to ensure consistency.
     pub fn range_process<F>(&self, mut f: F)
     where
         F: FnMut(&K, &V) -> (Op, Option<V>),
@@ -915,18 +932,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        let table = self.table.seq_load();
-        table.sum_size()
-    }
-    pub fn is_empty(&self) -> bool {
-        let table = self.table.seq_load();
-        !table.sum_size_exceeds(0)
-    }
-
-    pub fn clear(&self) {
-        self.try_resize(ResizeHint::Clear);
-    }
+    // ============================================================================================
+    // PRIVATE HELPER METHODS
+    // ============================================================================================
 
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
@@ -944,7 +952,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn h2(&self, hash64: u64) -> u8 {
-        (hash64 as u8) | (SLOT_MASK as u8)
+        (hash64 as u8) | (SLOT_MASK as u8) // Use top 7 bits, avoid 0x80 which is used for locking
     }
 
     #[inline(always)]
@@ -959,21 +967,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             self.try_resize(ResizeHint::Grow);
         }
     }
-
-    // #[inline(always)]
-    // fn maybe_resize_after_remove(&self, table: &Table<K, V>) {
-    //     if !self.shrink_on {
-    //         return;
-    //     }
-    //     if self.resize_state.started.load(Ordering::Acquire) {
-    //         return;
-    //     }
-    //     let cap = (table.mask + 1) * ENTRIES_PER_BUCKET;
-    //     let total = self.sum_size(table);
-    //     if cap > MIN_TABLE_LEN * ENTRIES_PER_BUCKET && total.saturating_mul(SHRINK_FRACTION) < cap {
-    //         self.try_resize(ResizeHint::Shrink);
-    //     }
-    // }
 
     fn try_resize(&self, hint: ResizeHint) {
         // Check if resize is already in progress using the started flag
@@ -1112,7 +1105,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         new_table: &Table<K, V>,
         chunk_id: usize,
         total_chunks: usize,
-        //is_growth: bool,
     ) where
         K: Clone + Eq + Hash,
         V: Clone,
@@ -1122,17 +1114,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let start = chunk_id * chunk_size;
         let end = std::cmp::min(start + chunk_size, old_len);
         let mut total_copied = 0;
-        // if is_growth {
-        // Growth: only lock source buckets, not destination buckets
+
         for i in start..end {
             total_copied += self.copy_bucket(old_table.get_bucket(i), new_table);
         }
-        // } else {
-        //     // Shrink: lock both source and destination buckets
-        //     for i in start.end {
-        //         total_copied += self.copy_bucket_lock(old_table.get_bucket(i), new_table);
-        //     }
-        // }
         // Update size in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
             new_table.add_size(start, total_copied as isize);
@@ -1317,6 +1302,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     }
 }
 
+// ================================================================================================
+// BUCKET IMPLEMENTATION
+// ================================================================================================
+
 impl<K, V> Bucket<K, V> {
     #[inline(always)]
     fn new() -> Self {
@@ -1327,6 +1316,7 @@ impl<K, V> Bucket<K, V> {
             entries: UnsafeCell::new(std::array::from_fn(|_| Entry::default())),
         }
     }
+
     #[inline(always)]
     fn single(_hash: u64, h2: u8, key: K, val: V) -> Self {
         let b = Self::new();
@@ -1402,6 +1392,42 @@ impl<K, V> Bucket<K, V> {
         }
     }
 }
+
+impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
+    fn clone(&self) -> Self {
+        // shallow clone meta/seq, deep-copy entries, ignore next for table swap simplicity
+        let mut entries_arr: [Entry<K, V>; ENTRIES_PER_BUCKET] =
+            std::array::from_fn(|_| Entry::default());
+        let src_entries = unsafe { &*self.entries.get() };
+        let meta = self.meta.load(Ordering::Relaxed);
+        let mut marked = meta & META_MASK;
+        while marked != 0 {
+            let j = first_marked_byte_index(marked);
+            entries_arr[j].hash = src_entries[j].hash; // Copy the full hash including init flag
+            unsafe {
+                entries_arr[j]
+                    .key
+                    .as_mut_ptr()
+                    .write((*src_entries[j].key.assume_init_ref()).clone());
+                entries_arr[j]
+                    .val
+                    .as_mut_ptr()
+                    .write((*src_entries[j].val.assume_init_ref()).clone());
+            }
+            marked &= marked - 1;
+        }
+        Bucket {
+            seq: AtomicU64::new(0), // Reset seq for new bucket
+            meta: AtomicU64::new(meta),
+            next: AtomicPtr::new(std::ptr::null_mut()), // reset chain; will be rebuilt on resize path
+            entries: UnsafeCell::new(entries_arr),
+        }
+    }
+}
+
+// ================================================================================================
+// TABLE IMPLEMENTATION
+// ================================================================================================
 
 impl<K, V> Table<K, V> {
     /// Helper methods for accessing UnsafeCell fields
@@ -1519,112 +1545,9 @@ impl<K, V> Table<K, V> {
     }
 }
 
-#[inline(always)]
-fn broadcast(b: u8) -> u64 {
-    0x0101_0101_0101_0101u64 * (b as u64)
-}
-
-#[inline(always)]
-fn first_marked_byte_index(w: u64) -> usize {
-    (w.trailing_zeros() >> 3) as usize
-}
-
-#[inline(always)]
-fn mark_zero_bytes(w: u64) -> u64 {
-    (w.wrapping_sub(0x0101_0101_0101_0101)) & (!w) & META_MASK
-}
-
-#[inline(always)]
-fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
-    let shift = (idx as u64) << 3;
-    (w & !(0xffu64 << shift)) | ((b as u64) << shift)
-}
-
-pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
-    map: &FlatMap<K, V, S>,
-) -> impl Iterator<Item = (K, V)> {
-    let mut items: Vec<(K, V)> = Vec::new();
-    map.range(|k, v| {
-        items.push((k.clone(), v.clone()));
-        true
-    });
-    items.into_iter()
-}
-#[inline(always)]
-fn try_spin(spins: &mut i32) -> bool {
-    // Adaptive backoff: spin briefly, then yield to scheduler, then stop
-    if *spins < 50 {
-        *spins += 1;
-        std::hint::spin_loop();
-        true
-    } else if *spins < 100 {
-        *spins += 1;
-        thread::yield_now();
-        true
-    } else {
-        false
-    }
-}
-
-impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
-    fn drop(&mut self) {
-        // Clean up the main table
-        if !self.table.buckets().is_null() {
-            let buckets_len = self.table.mask() + 1;
-
-            // Clean up linked buckets first
-            for i in 0..buckets_len {
-                unsafe {
-                    let bucket = self.table.get_bucket(i);
-                    let mut ptr = bucket.next.load(Ordering::Relaxed);
-                    while !ptr.is_null() {
-                        let next_ptr = (*ptr).next.load(Ordering::Relaxed);
-                        let _ = Box::from_raw(ptr);
-                        ptr = next_ptr;
-                    }
-                }
-            }
-
-            // Drop buckets in place
-            for i in 0..buckets_len {
-                unsafe {
-                    std::ptr::drop_in_place(self.table.get_bucket_mut(i));
-                }
-            }
-
-            // Deallocate buckets memory
-            unsafe {
-                let buckets_layout =
-                    std::alloc::Layout::array::<Bucket<K, V>>(buckets_len).unwrap();
-                std::alloc::dealloc(self.table.buckets() as *mut u8, buckets_layout);
-            }
-        }
-
-        if !self.table.size().is_null() {
-            let size_len = self.table.size_mask() as usize + 1;
-
-            // AtomicUsize doesn't need drop_in_place, just deallocate memory
-            unsafe {
-                let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
-                std::alloc::dealloc(self.table.size() as *mut u8, size_layout);
-            }
-        }
-
-        // Clean up old tables
-        unsafe {
-            let old_tables = &mut *self.old_tables.get();
-            old_tables.clear();
-        }
-    }
-}
-
-impl<K, V> Drop for Table<K, V> {
-    fn drop(&mut self) {
-        // TODO: Fix memory management for seqlock implementation
-        // For now, disable automatic cleanup to avoid heap corruption
-        // Memory will be cleaned up by FlatMap's Drop implementation
-    }
-}
+// ================================================================================================
+// ENTRY IMPLEMENTATION
+// ================================================================================================
 
 impl<K, V> Entry<K, V> {
     /// Check if this entry is initialized (occupied)
@@ -1724,29 +1647,132 @@ impl<K, V> Entry<K, V> {
         self.key = MaybeUninit::new(key);
         self.val = MaybeUninit::new(value);
     }
-
-    // /// Safe value update for occupied entries
-    // #[inline(always)]
-    // fn update_value(&mut self, new_value: V) {
-    //     debug_assert!(self.is_occupied(), "Entry must be occupied to update value");
-    //     unsafe {
-    //         std::ptr::drop_in_place(self.val.as_mut_ptr());
-    //         self.val = MaybeUninit::new(new_value);
-    //     }
-    // }
-
-    // /// Safe entry cleanup (drops key and value if occupied)
-    // #[inline(always)]
-    // fn cleanup(&mut self) {
-    //     if self.is_occupied() {
-    //         unsafe {
-    //             std::ptr::drop_in_place(self.key.as_mut_ptr());
-    //             std::ptr::drop_in_place(self.val.as_mut_ptr());
-    //         }
-    //         self.clear();
-    //     }
-    // }
 }
+
+// ================================================================================================
+// UTILITY FUNCTIONS FOR BIT MANIPULATION
+// ================================================================================================
+
+#[inline(always)]
+fn broadcast(b: u8) -> u64 {
+    (b as u64) * 0x0101_0101_0101_0101
+}
+
+#[inline(always)]
+fn first_marked_byte_index(w: u64) -> usize {
+    (w.trailing_zeros() >> 3) as usize
+}
+
+#[inline(always)]
+fn mark_zero_bytes(w: u64) -> u64 {
+    (w.wrapping_sub(0x0101_0101_0101_0101)) & (!w) & META_MASK
+}
+
+#[inline(always)]
+fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
+    let shift = (idx as u64) << 3;
+    (w & !(0xffu64 << shift)) | ((b as u64) << shift)
+}
+
+#[inline(always)]
+fn try_spin(spins: &mut i32) -> bool {
+    // Adaptive backoff: spin briefly, then yield to scheduler, then stop
+    if *spins < 50 {
+        *spins += 1;
+        std::hint::spin_loop();
+        true
+    } else if *spins < 100 {
+        *spins += 1;
+        thread::yield_now();
+        true
+    } else {
+        false
+    }
+}
+
+// ================================================================================================
+// STANDALONE ITERATOR FUNCTION
+// ================================================================================================
+
+/// Create an iterator over the key-value pairs in the map.
+pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
+    map: &FlatMap<K, V, S>,
+) -> impl Iterator<Item = (K, V)> {
+    let mut items: Vec<(K, V)> = Vec::new();
+    map.range(|k, v| {
+        items.push((k.clone(), v.clone()));
+        true
+    });
+    items.into_iter()
+}
+
+// ================================================================================================
+// DROP IMPLEMENTATIONS
+// ================================================================================================
+
+impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
+    fn drop(&mut self) {
+        // Clean up the main table
+        if !self.table.buckets().is_null() {
+            let buckets_len = self.table.mask() + 1;
+
+            // Clean up linked buckets first
+            for i in 0..buckets_len {
+                unsafe {
+                    let bucket = self.table.get_bucket(i);
+                    let mut ptr = bucket.next.load(Ordering::Relaxed);
+                    while !ptr.is_null() {
+                        let next_ptr = (*ptr).next.load(Ordering::Relaxed);
+                        let _ = Box::from_raw(ptr);
+                        ptr = next_ptr;
+                    }
+                }
+            }
+
+            // Drop buckets in place
+            for i in 0..buckets_len {
+                unsafe {
+                    std::ptr::drop_in_place(self.table.get_bucket_mut(i));
+                }
+            }
+
+            // Deallocate buckets memory
+            unsafe {
+                let buckets_layout =
+                    std::alloc::Layout::array::<Bucket<K, V>>(buckets_len).unwrap();
+                std::alloc::dealloc(self.table.buckets() as *mut u8, buckets_layout);
+            }
+        }
+
+        if !self.table.size().is_null() {
+            let size_len = self.table.size_mask() as usize + 1;
+
+            // AtomicUsize doesn't need drop_in_place, just deallocate memory
+            unsafe {
+                let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
+                std::alloc::dealloc(self.table.size() as *mut u8, size_layout);
+            }
+        }
+
+        // Clean up old tables
+        unsafe {
+            let old_tables = &mut *self.old_tables.get();
+            old_tables.clear();
+        }
+    }
+}
+
+impl<K, V> Drop for Table<K, V> {
+    fn drop(&mut self) {
+        // TODO: Fix memory management for seqlock implementation
+        // For now, disable automatic cleanup to avoid heap corruption
+        // Memory will be cleaned up by FlatMap's Drop implementation
+    }
+}
+
+// ================================================================================================
+// STANDARD TRAIT IMPLEMENTATIONS
+// ================================================================================================
 
 // Provide idiomatic trait implementations to integrate with the Rust ecosystem.
 impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Default for FlatMap<K, V, S> {
