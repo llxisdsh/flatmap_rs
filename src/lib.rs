@@ -477,14 +477,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     ///         in the map. If the closure returns false for any pair, the iteration will
     ///         be stopped.
     pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
-        // In root bucket lock, collect clones to avoid concurrent
-        // tearing, then callback user closure after unlock
+        // Optimized version: call user closure directly in lock to avoid Vec allocation
         let table = self.table.seq_load();
-        for i in 0..(table.mask() + 1) {
+        'outer: for i in 0..(table.mask() + 1) {
             let root = table.get_bucket(i);
             root.lock();
             let mut bucket_opt = Some(root);
-            let mut items: Vec<(K, V)> = Vec::new();
             while let Some(b) = bucket_opt {
                 let entries_ref = b.get_entries();
                 let meta = b.meta.load(Ordering::Relaxed);
@@ -495,61 +493,45 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     // Only access key/value if slot is marked as occupied in meta
                     if (meta >> (j * 8)) & SLOT_MASK != 0 {
                         let (k, v) = unsafe { e.unsafe_clone_key_value() };
-                        items.push((k, v));
+                        // Call user closure directly while holding lock
+                        if !f(&k, &v) {
+                            root.unlock();
+                            break 'outer;
+                        }
                     }
                     marked &= marked - 1;
                 }
                 bucket_opt = b.get_next_bucket_relaxed();
             }
             root.unlock();
-            for (k, v) in items {
-                if !f(&k, &v) {
-                    return;
-                }
-            }
         }
     }
 
     /// Returns an iterator over the key-value pairs in the map.
     /// The iterator is a clone of the map's contents, so it does not reflect any changes
     /// made to the map after the iterator is created.
-    pub fn iter(&self) -> impl Iterator<Item = (K, V)>
+    pub fn iter(&self) -> IterIterator<K, V, S>
     where
         K: Clone,
         V: Clone,
     {
-        let mut items: Vec<(K, V)> = Vec::new();
-        self.range(|k, v| {
-            items.push((k.clone(), v.clone()));
-            true
-        });
-        items.into_iter()
+        IterIterator::<K, V, S>::new(self)
     }
 
     /// Returns an iterator over the cloned keys of the map at the moment of call.
-    pub fn keys(&self) -> impl Iterator<Item = K>
+    pub fn keys(&self) -> KeysIterator<K, V, S>
     where
         K: Clone,
     {
-        let mut keys: Vec<K> = Vec::new();
-        self.range(|k, _| {
-            keys.push(k.clone());
-            true
-        });
-        keys.into_iter()
+        KeysIterator::<K, V, S>::new(self)
     }
 
     /// Returns an iterator over the cloned values of the map at the moment of call.
-    pub fn values(&self) -> impl Iterator<Item = V>
+    pub fn values(&self) -> ValuesIterator<K, V, S>
     where
         V: Clone,
     {
-        let mut vals: Vec<V> = Vec::new();
-        self.range(|_, v| {
-            vals.push(v.clone());
-            true
-        });
-        vals.into_iter()
+        ValuesIterator::<K, V, S>::new(self)
     }
 
     /// Returns the number of key-value pairs in the map.
@@ -763,7 +745,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                                 (None, Some(new_v))
                             } else {
-                                // Need to create new bucket – use recorded tail bucket
+                                // Need to create new bucket - use recorded tail bucket
                                 let new_bucket =
                                     Box::new(Bucket::single(hash64, h2, key, new_v.clone()));
                                 let new_bucket_ptr = Box::into_raw(new_bucket);
@@ -1614,22 +1596,6 @@ impl<K, V> Entry<K, V> {
 }
 
 // ================================================================================================
-// STANDALONE ITERATOR FUNCTION
-// ================================================================================================
-
-/// Create an iterator over the key-value pairs in the map.
-pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
-    map: &FlatMap<K, V, S>,
-) -> impl Iterator<Item = (K, V)> {
-    let mut items: Vec<(K, V)> = Vec::new();
-    map.range(|k, v| {
-        items.push((k.clone(), v.clone()));
-        true
-    });
-    items.into_iter()
-}
-
-// ================================================================================================
 // DROP IMPLEMENTATIONS
 // ================================================================================================
 
@@ -1823,5 +1789,272 @@ fn delay(spins: &mut i32) {
     } else {
         *spins = 0;
         thread::yield_now();
+    }
+}
+
+/// Iterator over the keys of a FlatMap
+pub struct KeysIterator<K, V, S = RandomState>
+where
+    S: BuildHasher,
+{
+    map: *const FlatMap<K, V, S>,
+    bucket_index: usize,
+    entries_collected: Vec<K>,
+    entries_index: usize,
+}
+
+impl<K, V, S> KeysIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(map: &FlatMap<K, V, S>) -> Self {
+        Self {
+            map: map as *const FlatMap<K, V, S>,
+            bucket_index: 0,
+            entries_collected: Vec::new(),
+            entries_index: 0,
+        }
+    }
+
+    fn collect_bucket_keys(&mut self) -> bool {
+        let map = unsafe { &*self.map };
+        let table = map.table.seq_load();
+
+        while self.bucket_index <= table.mask() {
+            let root = table.get_bucket(self.bucket_index);
+            root.lock();
+
+            let mut bucket_opt = Some(root);
+            self.entries_collected.clear();
+
+            while let Some(b) = bucket_opt {
+                let entries_ref = b.get_entries();
+                let meta = b.meta.load(Ordering::Relaxed);
+                let mut marked = meta & META_MASK;
+
+                while marked != 0 {
+                    let j = first_marked_byte_index(marked);
+                    let e = &entries_ref[j];
+                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
+                        let (k, _) = unsafe { e.unsafe_clone_key_value() };
+                        self.entries_collected.push(k);
+                    }
+                    marked &= marked - 1;
+                }
+                bucket_opt = b.get_next_bucket_relaxed();
+            }
+
+            root.unlock();
+            self.bucket_index += 1;
+
+            if !self.entries_collected.is_empty() {
+                self.entries_index = 0;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<K, V, S> Iterator for KeysIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    type Item = K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.entries_index < self.entries_collected.len() {
+            let key = self.entries_collected[self.entries_index].clone();
+            self.entries_index += 1;
+            return Some(key);
+        }
+
+        if self.collect_bucket_keys() {
+            self.next()
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterator over the values of a FlatMap
+pub struct ValuesIterator<K, V, S = RandomState>
+where
+    S: BuildHasher,
+{
+    map: *const FlatMap<K, V, S>,
+    bucket_index: usize,
+    entries_collected: Vec<V>,
+    entries_index: usize,
+}
+
+impl<K, V, S> ValuesIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(map: &FlatMap<K, V, S>) -> Self {
+        Self {
+            map: map as *const FlatMap<K, V, S>,
+            bucket_index: 0,
+            entries_collected: Vec::new(),
+            entries_index: 0,
+        }
+    }
+
+    fn collect_bucket_values(&mut self) -> bool {
+        let map = unsafe { &*self.map };
+        let table = map.table.seq_load();
+
+        while self.bucket_index <= table.mask() {
+            let root = table.get_bucket(self.bucket_index);
+            root.lock();
+
+            let mut bucket_opt = Some(root);
+            self.entries_collected.clear();
+
+            while let Some(b) = bucket_opt {
+                let entries_ref = b.get_entries();
+                let meta = b.meta.load(Ordering::Relaxed);
+                let mut marked = meta & META_MASK;
+
+                while marked != 0 {
+                    let j = first_marked_byte_index(marked);
+                    let e = &entries_ref[j];
+                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
+                        let (_, v) = unsafe { e.unsafe_clone_key_value() };
+                        self.entries_collected.push(v);
+                    }
+                    marked &= marked - 1;
+                }
+                bucket_opt = b.get_next_bucket_relaxed();
+            }
+
+            root.unlock();
+            self.bucket_index += 1;
+
+            if !self.entries_collected.is_empty() {
+                self.entries_index = 0;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<K, V, S> Iterator for ValuesIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    type Item = V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.entries_index < self.entries_collected.len() {
+            let value = self.entries_collected[self.entries_index].clone();
+            self.entries_index += 1;
+            return Some(value);
+        }
+
+        if self.collect_bucket_values() {
+            self.next()
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterator over the key-value pairs of a FlatMap
+pub struct IterIterator<K, V, S = RandomState>
+where
+    S: BuildHasher,
+{
+    map: *const FlatMap<K, V, S>,
+    bucket_index: usize,
+    entries_collected: Vec<(K, V)>,
+    entries_index: usize,
+}
+
+impl<K, V, S> IterIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(map: &FlatMap<K, V, S>) -> Self {
+        Self {
+            map: map as *const FlatMap<K, V, S>,
+            bucket_index: 0,
+            entries_collected: Vec::new(),
+            entries_index: 0,
+        }
+    }
+
+    fn collect_bucket_pairs(&mut self) -> bool {
+        let map = unsafe { &*self.map };
+        let table = map.table.seq_load();
+
+        while self.bucket_index <= table.mask() {
+            let root = table.get_bucket(self.bucket_index);
+            root.lock();
+
+            let mut bucket_opt = Some(root);
+            self.entries_collected.clear();
+
+            while let Some(b) = bucket_opt {
+                let entries_ref = b.get_entries();
+                let meta = b.meta.load(Ordering::Relaxed);
+                let mut marked = meta & META_MASK;
+
+                while marked != 0 {
+                    let j = first_marked_byte_index(marked);
+                    let e = &entries_ref[j];
+                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
+                        let (k, v) = unsafe { e.unsafe_clone_key_value() };
+                        self.entries_collected.push((k, v));
+                    }
+                    marked &= marked - 1;
+                }
+                bucket_opt = b.get_next_bucket_relaxed();
+            }
+
+            root.unlock();
+            self.bucket_index += 1;
+
+            if !self.entries_collected.is_empty() {
+                self.entries_index = 0;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<K, V, S> Iterator for IterIterator<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.entries_index < self.entries_collected.len() {
+            let pair = self.entries_collected[self.entries_index].clone();
+            self.entries_index += 1;
+            return Some(pair);
+        }
+
+        if self.collect_bucket_pairs() {
+            self.next()
+        } else {
+            None
+        }
     }
 }
