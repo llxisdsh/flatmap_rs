@@ -18,7 +18,6 @@ const LOAD_FACTOR: f64 = 0.75;
 // const SHRINK_FRACTION: usize = 8;
 const MIN_TABLE_LEN: usize = 32;
 const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000; // highest meta byte's 0x80 bit acts as root lock
-const NUM_STRIPES: usize = 64;
 
 // Parallel resize constants
 const MIN_BUCKETS_PER_CPU: usize = 64; // Minimum buckets per CPU thread
@@ -44,6 +43,10 @@ fn calc_table_len(size_hint: usize) -> usize {
     let min_cap = (size_hint as f64 * (1.0 / (ENTRIES_PER_BUCKET as f64 * LOAD_FACTOR))) as usize;
     let base = min_cap.max(MIN_TABLE_LEN);
     next_pow2(base)
+}
+
+fn calc_size_len(table_len: usize, cpus: usize) -> usize {
+    next_pow2(cpus.min(table_len >> 10))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -117,9 +120,10 @@ unsafe impl<K: Send, V: Send, S: Send + BuildHasher> Send for FlatMap<K, V, S> {
 unsafe impl<K: Sync, V: Sync, S: Sync + BuildHasher> Sync for FlatMap<K, V, S> {}
 
 struct Table<K, V> {
-    buckets: Vec<Bucket<K, V>>,
+    buckets: *mut Bucket<K, V>,
     mask: usize,
-    counters: [AtomicU64; NUM_STRIPES],
+    counters: *mut AtomicU64,
+    counters_mask: usize,
 }
 
 #[repr(align(8))]
@@ -224,14 +228,44 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     /// hashing. This is the recommended way to set a custom hashing strategy.
     pub fn with_capacity_and_hasher(size_hint: usize, hasher: S) -> Self {
         let len = calc_table_len(size_hint);
-        let mut buckets = Vec::with_capacity(len);
-        for _ in 0..len {
-            buckets.push(Bucket::new());
+        let cpus = thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let counters_len = calc_size_len(len, cpus);
+
+        // Allocate buckets as raw pointer
+        let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(len).unwrap();
+        let buckets_ptr = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
+        if buckets_ptr.is_null() {
+            std::alloc::handle_alloc_error(buckets_layout);
         }
+
+        // Initialize buckets
+        for i in 0..len {
+            unsafe {
+                std::ptr::write(buckets_ptr.add(i), Bucket::new());
+            }
+        }
+
+        // Allocate counters as raw pointer
+        let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
+        let counters_ptr = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicU64 };
+        if counters_ptr.is_null() {
+            std::alloc::handle_alloc_error(counters_layout);
+        }
+
+        // Initialize counters
+        for i in 0..counters_len {
+            unsafe {
+                std::ptr::write(counters_ptr.add(i), AtomicU64::new(0));
+            }
+        }
+
         let table = Table {
-            buckets,
+            buckets: buckets_ptr,
             mask: len - 1,
-            counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            counters: counters_ptr,
+            counters_mask: counters_len - 1,
         };
         let table_ptr = Box::into_raw(Box::new(table));
         Self {
@@ -288,7 +322,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let table = self.load_table();
         let (hash64, hash_u8) = self.hash_pair(key);
         let idx = self.h1_mask(hash64, table.mask);
-        let root = &table.buckets[idx];
+        let root = unsafe { &*table.buckets.add(idx) };
         let h2w = broadcast(hash_u8);
 
         // Traverse bucket chain (like Go version)
@@ -475,8 +509,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         // In root bucket lock, collect clones to avoid concurrent
         // tearing, then callback user closure after unlock
         let table = self.load_table();
-        for i in 0..table.buckets.len() {
-            let root = &table.buckets[i];
+        for i in 0..(table.mask + 1) {
+            let root = unsafe { &*table.buckets.add(i) };
             root.lock();
             let mut b = root;
             let mut items: Vec<(K, V)> = Vec::new();
@@ -575,7 +609,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         loop {
             let table = self.load_table();
             let idx = self.h1_mask(hash64, table.mask);
-            let root = &table.buckets[idx];
+            let root = unsafe { &*table.buckets.add(idx) };
 
             root.lock();
 
@@ -686,8 +720,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                         root.unlock();
                         // Update counter
-                        let stripe = stripe_index(idx);
-                        table.counters[stripe].fetch_sub(1, Ordering::Relaxed);
+                        let stripe = idx & table.counters_mask;
+                        unsafe { &*table.counters.add(stripe) }.fetch_sub(1, Ordering::Relaxed);
                         // self.maybe_resize_after_remove(table);
                         (Some(old_val), None)
                     }
@@ -726,8 +760,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = stripe_index(idx);
-                                table.counters[stripe].fetch_add(1, Ordering::Relaxed);
+                                let stripe = idx & table.counters_mask;
+                                unsafe { &*table.counters.add(stripe) }
+                                    .fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
                                 (None, Some(new_v))
@@ -749,8 +784,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                 root.unlock();
 
                                 // Update counter
-                                let stripe = stripe_index(idx);
-                                table.counters[stripe].fetch_add(1, Ordering::Relaxed);
+                                let stripe = idx & table.counters_mask;
+                                unsafe { &*table.counters.add(stripe) }
+                                    .fetch_add(1, Ordering::Relaxed);
 
                                 self.maybe_resize_after_insert(table);
                                 (None, Some(new_v))
@@ -777,8 +813,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         'restart: loop {
             let table = self.load_table();
 
-            for i in 0..table.buckets.len() {
-                let root = &table.buckets[i];
+            for i in 0..(table.mask + 1) {
+                let root = unsafe { &*table.buckets.add(i) };
                 root.lock();
 
                 // Check if resize is in progress and help complete the copy
@@ -847,8 +883,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                                     }
 
                                     // Decrement counter using bucket index like Go version
-                                    let stripe_idx = stripe_index(i);
-                                    table.counters[stripe_idx].fetch_sub(1, Ordering::Relaxed);
+                                    let stripe_idx = i & table.counters_mask;
+                                    unsafe { &*table.counters.add(stripe_idx) }
+                                        .fetch_sub(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -909,8 +946,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     #[inline(always)]
     fn sum_counters(&self, table: &Table<K, V>) -> usize {
         let mut s = 0usize;
-        for i in 0..NUM_STRIPES {
-            let c = table.counters[i].load(Ordering::Relaxed) as usize;
+        for i in 0..(table.counters_mask + 1) {
+            let c = unsafe { &*table.counters.add(i) }.load(Ordering::Relaxed) as usize;
             s = s.wrapping_add(c);
         }
         s
@@ -1080,18 +1117,20 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         if is_growth {
             // Growth: only lock source buckets, not destination buckets
             for i in start..end {
-                total_copied += self.copy_bucket(&old_table.buckets[i], new_table);
+                total_copied += self.copy_bucket(unsafe { &*old_table.buckets.add(i) }, new_table);
             }
         } else {
             // Shrink: lock both source and destination buckets
             for i in start..end {
-                total_copied += self.copy_bucket_lock(&old_table.buckets[i], new_table);
+                total_copied +=
+                    self.copy_bucket_lock(unsafe { &*old_table.buckets.add(i) }, new_table);
             }
         }
         // Update counters in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
-            let stripe = stripe_index(start);
-            new_table.counters[stripe].fetch_add(total_copied as u64, Ordering::Relaxed);
+            let stripe = start & new_table.counters_mask;
+            unsafe { &*new_table.counters.add(stripe) }
+                .fetch_add(total_copied as u64, Ordering::Relaxed);
         }
     }
 
@@ -1124,7 +1163,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask);
-                    let dest_bucket = &new_table.buckets[idx];
+                    let dest_bucket = unsafe { &*new_table.buckets.add(idx) };
                     dest_bucket.lock();
 
                     // Direct insertion into destination bucket (like Go's appendTo loop)
@@ -1210,7 +1249,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                     // For shrink operations, lock destination bucket during insertion
                     let idx = self.h1_mask(hash64, new_table.mask);
-                    let dest_bucket = &new_table.buckets[idx];
+                    let dest_bucket = unsafe { &*new_table.buckets.add(idx) };
                     //dest_bucket.lock();
 
                     // Direct insertion into destination bucket (like Go's appendTo loop)
@@ -1293,14 +1332,39 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get());
 
         // Create the new table (this is where the actual allocation happens)
-        let mut buckets = Vec::with_capacity(new_len);
-        for _ in 0..new_len {
-            buckets.push(Bucket::new());
+        let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(new_len).unwrap();
+        let buckets = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
+        if buckets.is_null() {
+            std::alloc::handle_alloc_error(buckets_layout);
         }
+
+        // Initialize buckets
+        for i in 0..new_len {
+            unsafe {
+                std::ptr::write(buckets.add(i), Bucket::new());
+            }
+        }
+
+        // Allocate and initialize counters
+        let counters_len = calc_size_len(new_len, num_cpus::get());
+        let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
+        let counters = unsafe { std::alloc::alloc(counters_layout) as *mut AtomicU64 };
+        if counters.is_null() {
+            std::alloc::handle_alloc_error(counters_layout);
+        }
+
+        // Initialize counters
+        for i in 0..counters_len {
+            unsafe {
+                std::ptr::write(counters.add(i), AtomicU64::new(0));
+            }
+        }
+
         let new_table = Box::new(Table {
             buckets,
             mask: new_len - 1,
-            counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            counters,
+            counters_mask: counters_len - 1,
         });
 
         if unsafe { *state.hint.get() } == ResizeHint::Clear {
@@ -1408,11 +1472,6 @@ fn set_byte(w: u64, b: u8, idx: usize) -> u64 {
     (w & !(0xffu64 << shift)) | ((b as u64) << shift)
 }
 
-#[inline(always)]
-fn stripe_index(idx: usize) -> usize {
-    idx & (NUM_STRIPES - 1)
-}
-
 pub fn iter<K: Clone + Eq + Hash, V: Clone, S: BuildHasher>(
     map: &FlatMap<K, V, S>,
 ) -> impl Iterator<Item = (K, V)> {
@@ -1459,14 +1518,44 @@ impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
 
 impl<K, V> Drop for Table<K, V> {
     fn drop(&mut self) {
-        for b in &self.buckets {
-            let mut ptr = b.next.load(Ordering::Relaxed);
-            while !ptr.is_null() {
+        if !self.buckets.is_null() {
+            let buckets_len = self.mask + 1;
+
+            // Clean up linked buckets first
+            for i in 0..buckets_len {
                 unsafe {
-                    let next_ptr = (*ptr).next.load(Ordering::Relaxed);
-                    let _ = Box::from_raw(ptr);
-                    ptr = next_ptr;
+                    let bucket = &*self.buckets.add(i);
+                    let mut ptr = bucket.next.load(Ordering::Relaxed);
+                    while !ptr.is_null() {
+                        let next_ptr = (*ptr).next.load(Ordering::Relaxed);
+                        let _ = Box::from_raw(ptr);
+                        ptr = next_ptr;
+                    }
                 }
+            }
+
+            // Drop buckets in place
+            for i in 0..buckets_len {
+                unsafe {
+                    std::ptr::drop_in_place(self.buckets.add(i));
+                }
+            }
+
+            // Deallocate buckets memory
+            unsafe {
+                let buckets_layout =
+                    std::alloc::Layout::array::<Bucket<K, V>>(buckets_len).unwrap();
+                std::alloc::dealloc(self.buckets as *mut u8, buckets_layout);
+            }
+        }
+
+        if !self.counters.is_null() {
+            let counters_len = self.counters_mask + 1;
+
+            // AtomicU64 doesn't need drop_in_place, just deallocate memory
+            unsafe {
+                let counters_layout = std::alloc::Layout::array::<AtomicU64>(counters_len).unwrap();
+                std::alloc::dealloc(self.counters as *mut u8, counters_layout);
             }
         }
     }
