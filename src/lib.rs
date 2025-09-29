@@ -5,7 +5,7 @@ use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+	AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
@@ -499,7 +499,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         let mut f_option = Some(f);
         let (old_val, new_val) = self.process(key, |old| {
             if let Some(v) = old {
-                (Op::Cancel, Some(v))
+                (Op::Cancel, Some(v.clone()))
             } else {
                 // Call f only once
                 let computed = f_option.take().unwrap()();
@@ -641,7 +641,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     /// * `(Option<V>, Option<V>)` - A tuple containing the old value (if any) and the new value (if any).
     pub fn process<F>(&self, key: K, mut f: F) -> (Option<V>, Option<V>)
     where
-        F: FnMut(Option<V>) -> (Op, Option<V>),
+        F: FnMut(Option<&V>) -> (Op, Option<V>),
         V: Clone,
     {
         let (hash64, h2) = self.hash_pair(&key);
@@ -673,6 +673,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let mut empty_slot_info: Option<(*const Bucket<K, V>, usize)> = None;
 
             let mut b = root;
+            // Track the last bucket to avoid a second traversal when appending
+            let mut last_bucket = b;
             'search_loop: loop {
                 let entries = b.get_entries();
                 let meta = b.meta.load(Ordering::Relaxed);
@@ -698,9 +700,11 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     }
                 }
 
+                // Update last bucket each iteration; if next is null, b is the tail
                 let next_ptr = b.next.load(Ordering::Relaxed);
                 if !next_ptr.is_null() {
-                    b = unsafe { &*next_ptr };
+                    last_bucket = unsafe { &*next_ptr };
+                    b = last_bucket;
                 } else {
                     break;
                 }
@@ -711,26 +715,29 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 let bucket = unsafe { &*bucket_ptr };
                 let entries = bucket.get_entries_mut();
                 let entry = &mut entries[slot];
-                let old_val = entry.clone_value();
-                let (op, new_val) = f(Some(old_val.clone()));
+                let old_ref = entry.get_value();
+                let (op, new_val) = f(Some(old_ref));
 
                 match op {
                     Op::Cancel => {
                         root.unlock();
-                        (Some(old_val.clone()), Some(old_val))
+                        let old_clone = old_ref.clone();
+                        (Some(old_clone.clone()), Some(old_clone))
                     }
                     Op::Update => {
                         if let Some(new_v) = new_val {
                             // Use seqlock to protect the write operation (like Go)
                             let seq = bucket.seq.load(Ordering::Relaxed);
                             bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                                                                          // Clone old value before mutation to end immutable borrow
+                            let old_clone = old_ref.clone();
                             entry.val = MaybeUninit::new(new_v.clone());
                             bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
                             root.unlock();
-                            (Some(old_val), Some(new_v))
+                            (Some(old_clone), Some(new_v))
                         } else {
                             root.unlock();
-                            (Some(old_val), None)
+                            (Some(old_ref.clone()), None)
                         }
                     }
                     Op::Delete => {
@@ -744,6 +751,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
 
                         // After publishing even seq, clear entry fields before releasing root lock
+                        // Clone old value before mutation to end immutable borrow
+                        let old_clone = old_ref.clone();
                         entry.clear();
                         unsafe {
                             std::ptr::drop_in_place(entry.key.as_mut_ptr());
@@ -754,7 +763,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         // Update counter
                         table.add_size(idx, -1);
                         // self.maybe_resize_after_remove(table);
-                        (Some(old_val), None)
+                        (Some(old_clone), None)
                     }
                 }
             } else {
@@ -793,14 +802,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
                                 (None, Some(new_v))
                             } else {
-                                // Need to create new bucket - find the last bucket in chain
-                                let mut last_bucket = b;
-                                while !last_bucket.next.load(Ordering::Relaxed).is_null() {
-                                    last_bucket =
-                                        unsafe { &*last_bucket.next.load(Ordering::Relaxed) };
-                                }
-
-                                // Create new bucket
+                                // Need to create new bucket – use recorded tail bucket
                                 let new_bucket =
                                     Box::new(Bucket::single(hash64, h2, key, new_v.clone()));
                                 let new_bucket_ptr = Box::into_raw(new_bucket);
