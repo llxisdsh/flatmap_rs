@@ -26,9 +26,10 @@ fn main() {
 
     // Test RangeProcess - increment all values by 1
     let mut count = 0;
-    map.range_process(|_, v| {
+    map.retain(|_, v| {
         count += 1;
-        (Op::Update, Some(*v + 1))
+        *v += 1;
+        true
     });
     println!("\nRangeProcess processed {} entries", count);
 

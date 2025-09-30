@@ -1,4 +1,4 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -26,9 +26,10 @@ fn stress_torn_read_test() {
         barrier_clone1.wait();
         let mut counter = 0;
         while !stop_flag_clone1.load(Ordering::Relaxed) {
-            map_clone1.range_process(|k, _v| {
+            map_clone1.retain(|k, v| {
                 let new_value = format!("updated_{}_{}", k, counter);
-                (Op::Update, Some(new_value))
+                *v = new_value;
+                true
             });
             counter += 1;
             thread::sleep(Duration::from_micros(1)); // Same as original

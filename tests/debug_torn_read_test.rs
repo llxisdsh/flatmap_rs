@@ -1,8 +1,8 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn debug_torn_read_test() {
@@ -13,7 +13,8 @@ fn debug_torn_read_test() {
     let debug_count = Arc::new(AtomicUsize::new(0));
 
     // Initialize with some values
-    for i in 0..10 {  // Smaller range for debugging
+    for i in 0..10 {
+        // Smaller range for debugging
         map.insert(i, format!("value_{}", i));
     }
 
@@ -26,12 +27,14 @@ fn debug_torn_read_test() {
         barrier_clone1.wait();
         let mut counter = 0;
         while !stop_flag_clone1.load(Ordering::Relaxed) {
-            map_clone1.range_process(|k, _v| {
+            map_clone1.retain(|k, v| {
                 let new_value = format!("updated_{}_{}", k, counter);
-                (Op::Update, Some(new_value))
+                *v = new_value;
+                true
             });
             counter += 1;
-            if counter > 5 { // Limit iterations for debugging
+            if counter > 5 {
+                // Limit iterations for debugging
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -51,10 +54,11 @@ fn debug_torn_read_test() {
             for i in 0..10 {
                 if let Some(value) = map_clone2.get(&i) {
                     let count = debug_count_clone.fetch_add(1, Ordering::Relaxed);
-                    if count < 20 { // Print first 20 reads for debugging
+                    if count < 20 {
+                        // Print first 20 reads for debugging
                         println!("Read key={}, value='{}'", i, value);
                     }
-                    
+
                     // Check if the value is consistent (not a torn read)
                     let value_str = value.as_str();
                     if !value_str.starts_with("value_") && !value_str.starts_with("updated_") {
@@ -65,7 +69,10 @@ fn debug_torn_read_test() {
                     if value_str.starts_with("updated_") {
                         let parts: Vec<&str> = value_str.split('_').collect();
                         if parts.len() != 3 {
-                            println!("TORN READ: Wrong part count for key={}, value='{}', parts={:?}", i, value, parts);
+                            println!(
+                                "TORN READ: Wrong part count for key={}, value='{}', parts={:?}",
+                                i, value, parts
+                            );
                             torn_read_count_clone.fetch_add(1, Ordering::Relaxed);
                         } else if parts[1] != i.to_string() {
                             println!("TORN READ: Wrong key in value for key={}, value='{}', expected_key={}, actual_key={}", i, value, i, parts[1]);
@@ -87,8 +94,15 @@ fn debug_torn_read_test() {
     reader.join().unwrap();
 
     println!("Total reads: {}", debug_count.load(Ordering::Relaxed));
-    println!("Torn reads detected: {}", torn_read_count.load(Ordering::Relaxed));
-    
+    println!(
+        "Torn reads detected: {}",
+        torn_read_count.load(Ordering::Relaxed)
+    );
+
     // Should have no torn reads
-    assert_eq!(torn_read_count.load(Ordering::Relaxed), 0, "Detected torn reads during concurrent range_process updates");
+    assert_eq!(
+        torn_read_count.load(Ordering::Relaxed),
+        0,
+        "Detected torn reads during concurrent range_process updates"
+    );
 }

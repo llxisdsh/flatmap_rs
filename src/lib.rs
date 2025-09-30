@@ -6,7 +6,7 @@ use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+	AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
@@ -508,7 +508,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     /// Removes all key-value pairs from the map.
     pub fn clear(&self) {
-        self.range_process(|_, _| (Op::Delete, None));
+        self.retain(|_, _| false);
     }
 
     // ============================================================================================
@@ -731,14 +731,17 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
         }
     }
 
-    /// Process all key-value pairs in the map with a user-defined function.
+    // ============================================================================================
+    // PRIVATE HELPER METHODS
+    // ============================================================================================
+
+    /// Retain entries for which the predicate returns true; allows in-place mutation of values.
     ///
-    /// The function receives references to each key and value and returns an operation and optional new value.
-    /// This method locks each bucket during processing to ensure consistency.
-    pub fn range_process<F>(&self, mut f: F)
+    /// The predicate receives `&K` and `&mut V` and returns `true` to keep the entry or `false` to delete it.
+    /// Processing occurs under per-bucket locks with seqlock writes guarding mutations and deletions.
+    pub fn retain<F>(&self, mut f: F) -> &Self
     where
-        F: FnMut(&K, &V) -> (Op, Option<V>),
-        V: Clone,
+        F: FnMut(&K, &mut V) -> bool,
     {
         'restart: loop {
             let table = self.table.seq_load();
@@ -767,53 +770,35 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     let entries = b.get_entries_mut();
                     let mut meta = b.meta.load(Ordering::Relaxed);
 
-                    // Use meta-based iteration like Go version: for marked := meta & META_MASK; marked != 0; marked &= marked - 1
+                    // Iterate occupied slots based on meta mask
                     let mut marked = meta & META_MASK;
                     while marked != 0 {
                         let j = first_marked_byte_index(marked);
                         let entry = &mut entries[j];
 
-                        let key = entry.get_key();
-                        let val = entry.get_value();
+                        let key_owned = entry.get_key().clone();
+                        let val_mut = entry.get_value_mut();
 
-                        let (op, new_val) = f(key, val);
+                        // Begin seqlock write to guard in-place mutation
+                        let seq0 = b.seq.load(Ordering::Relaxed);
+                        b.seq.store(seq0 + 1, Ordering::Relaxed); // odd
+                        let keep = f(&key_owned, val_mut);
 
-                        match op {
-                            Op::Cancel => {
-                                // No-op
+                        if !keep {
+                            // Delete entry: clear meta and drop key/value under seqlock
+                            meta = set_byte(meta, EMPTY_SLOT, j);
+                            b.meta.store(meta, Ordering::Relaxed);
+                            // Clear entry state and drop key/value
+                            entry.clear();
+                            unsafe {
+                                std::ptr::drop_in_place(entry.key.as_mut_ptr());
+                                std::ptr::drop_in_place(entry.val.as_mut_ptr());
                             }
-                            Op::Update => {
-                                if let Some(new_v) = new_val {
-                                    // Use seqlock to protect the write operation (like process method)
-                                    let seq = b.seq.load(Ordering::Relaxed);
-                                    b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                    unsafe {
-                                        std::ptr::drop_in_place(entry.val.as_mut_ptr());
-                                        entry.val.write(new_v);
-                                    }
-                                    b.seq.store(seq + 2, Ordering::Release);
-                                    // End write (make even)
-                                }
-                            }
-                            Op::Delete => {
-                                // Keep snapshot fresh to prevent stale meta
-                                meta = set_byte(meta, EMPTY_SLOT, j);
-                                let seq = b.seq.load(Ordering::Relaxed);
-                                b.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                b.meta.store(meta, Ordering::Relaxed);
-                                b.seq.store(seq + 2, Ordering::Release); // End write (make even)
-
-                                // Clear the entry AFTER seqlock protection (like process method)
-                                entry.clear();
-                                unsafe {
-                                    std::ptr::drop_in_place(entry.key.as_mut_ptr());
-                                    std::ptr::drop_in_place(entry.val.as_mut_ptr());
-                                }
-
-                                // Decrement counter using bucket index like Go version
-                                table.add_size(i, -1);
-                            }
+                            // Decrement size counter using bucket index
+                            table.add_size(i, -1);
                         }
+
+                        b.seq.store(seq0 + 2, Ordering::Release); // even
 
                         // Clear the lowest set bit: marked &= marked - 1
                         marked &= marked.wrapping_sub(1);
@@ -830,11 +815,8 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
             break; // Successfully completed
         }
+        self
     }
-
-    // ============================================================================================
-    // PRIVATE HELPER METHODS
-    // ============================================================================================
 
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
@@ -1474,6 +1456,12 @@ impl<K, V> Entry<K, V> {
     fn get_value(&self) -> &V {
         // debug_assert!(self.is_occupied(), "Entry must be occupied to access value");
         unsafe { self.val.assume_init_ref() }
+    }
+    /// Mutable value access for occupied entries (bucket lock required)
+    #[inline(always)]
+    fn get_value_mut(&mut self) -> &mut V {
+        // SAFETY: Caller must hold the bucket op lock to prevent concurrent readers/writers.
+        unsafe { self.val.assume_init_mut() }
     }
 
     // /// Safe cloned key access for occupied entries

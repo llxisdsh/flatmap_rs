@@ -1,4 +1,4 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
 use std::sync::{
 	atomic::{AtomicBool, Ordering},
 	Arc, Barrier,
@@ -44,9 +44,10 @@ fn range_process_restart_on_clear_and_shrink() {
     let ranger = thread::spawn(move || {
         s2.wait();
         while !st2.load(Ordering::Relaxed) {
-            m2.range_process(|_k, v| {
+            m2.retain(|_k, v| {
                 // No-op or small update; goal is to cross table swaps without panics/deadlocks
-                (Op::Update, Some(v + 1))
+                *v += 1;
+                true
             });
             thread::yield_now();
         }

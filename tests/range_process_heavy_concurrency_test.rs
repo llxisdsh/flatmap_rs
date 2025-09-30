@@ -1,4 +1,4 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
 use std::sync::{
 	atomic::{AtomicBool, AtomicUsize, Ordering},
 	Arc, Barrier,
@@ -61,13 +61,14 @@ fn range_process_under_heavy_concurrency_and_resize() {
         s3.wait();
         let deadline = Instant::now() + Duration::from_millis(600);
         while Instant::now() < deadline && !st3.load(Ordering::Relaxed) {
-            m3.range_process(|k, v| {
+            m3.retain(|k, v| {
                 if *k % 7 == 0 {
-                    (Op::Delete, None)
+                    false
                 } else if *k % 11 == 0 {
-                    (Op::Cancel, None)
+                    true
                 } else {
-                    (Op::Update, Some(v + 1))
+                    *v += 1;
+                    true
                 }
             });
             iters.fetch_add(1, Ordering::Relaxed);

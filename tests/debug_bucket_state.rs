@@ -1,4 +1,4 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
 
 #[test]
 fn test_bucket_state_after_range_delete() {
@@ -11,14 +11,14 @@ fn test_bucket_state_after_range_delete() {
 
     println!("Before range_process:");
 
-    // Delete some entries using range_process
-    map.range_process(|k, _v| {
-        if *k % 2 == 0 {
+    // Delete some entries using retain
+    map.retain(|k, _v| {
+        return if *k % 2 == 0 {
             println!("Deleting key: {}", k);
-            (Op::Delete, None)
+            false
         } else {
-            (Op::Cancel, None)
-        }
+            true
+        };
     });
 
     println!("After range_process, before get:");
