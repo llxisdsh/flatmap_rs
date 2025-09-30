@@ -27,7 +27,7 @@ const META_MASK: u64 = 0x0080_8080_8080_8080;
 const EMPTY_SLOT: u8 = 0;
 
 /// Mask for marking a bit in meta byte as slot marker
-const SLOT_MASK: u64 = 0x80;
+const SLOT_MASK: u8 = 0x80;
 
 /// Load factor for determining when to resize
 const LOAD_FACTOR: f64 = 0.75;
@@ -719,10 +719,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         }
     }
 
-    // ============================================================================================
-    // PRIVATE HELPER METHODS
-    // ============================================================================================
-
     /// Retain entries for which the predicate returns true; allows in-place mutation of values.
     ///
     /// The predicate receives `&K` and `&mut V` and returns `true` to keep the entry or `false` to delete it.
@@ -806,6 +802,10 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         self
     }
 
+    // ============================================================================================
+    // PRIVATE HELPER METHODS
+    // ============================================================================================
+
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
         // Use compile-time type checking for zero-cost optimization
@@ -876,7 +876,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
 
     #[inline(always)]
     fn h2(&self, hash64: u64) -> u8 {
-        (hash64 as u8) | (SLOT_MASK as u8) // Use top 7 bits, avoid 0x80 which is used for locking
+        (hash64 as u8) | SLOT_MASK // Use top 7 bits, avoid 0x80 which is used for locking
     }
 
     #[inline(always)]
