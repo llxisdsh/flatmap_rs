@@ -1229,7 +1229,7 @@ impl<K, V> Bucket<K, V> {
 
     #[inline(always)]
     fn unlock_with_meta(&self, meta: u64) {
-        // Clear lock bit while publishing a specific meta value
+        // Clear lock a bit while publishing a specific meta value
         self.meta.store(meta & !OP_LOCK_MASK, Ordering::Release);
     }
 
