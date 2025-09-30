@@ -61,6 +61,20 @@ fn cpu_count() -> usize {
 }
 
 // ================================================================================================
+// TYPE-SPECIALIZED HASHING SYSTEM
+// ================================================================================================
+
+/// Fast string hash similar to Go's hashString
+#[inline(always)]
+fn fast_hash_string(s: &str) -> (u64, bool) {
+    let mut hash = 0u64;
+    for byte in s.as_bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
+    }
+    (hash, false) // Use shift distribution for strings
+}
+
+// ================================================================================================
 // CORE TYPES AND ENUMS
 // ================================================================================================
 
@@ -199,7 +213,7 @@ unsafe impl<K: Sync, V: Sync, S: Sync + BuildHasher> Sync for FlatMap<K, V, S> {
 // FLATMAP CONSTRUCTORS
 // ================================================================================================
 
-impl<K: Eq + Hash + Clone, V: Clone> FlatMap<K, V, RandomState> {
+impl<K: Eq + Hash + Clone + 'static, V: Clone> FlatMap<K, V, RandomState> {
     /// Create a new FlatMap with default settings.
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -214,7 +228,32 @@ impl<K: Eq + Hash + Clone, V: Clone> FlatMap<K, V, RandomState> {
     }
 }
 
-impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
+// ================================================================================================
+// SPECIALIZED IMPLEMENTATIONS FOR NUMERIC TYPES
+// ================================================================================================
+
+/// Helper functions to check if a type is numeric at compile time
+#[inline(always)]
+fn is_numeric_type<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<usize>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i8>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i16>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i32>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i64>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<isize>()
+}
+
+#[inline(always)]
+fn is_string_type<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<String>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<&str>()
+}
+
+impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     /// Create a new FlatMap using the provided hasher.
     ///
     /// This constructor allows customizing the hashing strategy up front. Changing the hasher
@@ -769,14 +808,62 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
-        let h64 = self.hasher.hash_one(key).max(1);
+        // Use compile-time type checking for zero-cost optimization
+        let h64 = if is_numeric_type::<K>() {
+            // For numeric types, use the value directly (zero-cost like Go's intKey)
+            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u64>() {
+                unsafe { *(key as *const K as *const u64) }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u32>() {
+                unsafe { *(key as *const K as *const u32) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u16>() {
+                unsafe { *(key as *const K as *const u16) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u8>() {
+                unsafe { *(key as *const K as *const u8) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<usize>() {
+                unsafe { *(key as *const K as *const usize) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i64>() {
+                unsafe { *(key as *const K as *const i64) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i32>() {
+                unsafe { *(key as *const K as *const i32) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i16>() {
+                unsafe { *(key as *const K as *const i16) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i8>() {
+                unsafe { *(key as *const K as *const i8) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<isize>() {
+                unsafe { *(key as *const K as *const isize) as u64 }
+            } else {
+                // Should not reach here if is_numeric_type is correct
+                self.hasher.hash_one(key).max(1)
+            }
+        } else if is_string_type::<K>() {
+            // For string types, use optimized string hash
+            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<String>() {
+                let s = unsafe { &*(key as *const K as *const String) };
+                fast_hash_string(s).0
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<&str>() {
+                let s = unsafe { *(key as *const K as *const &str) };
+                fast_hash_string(s).0
+            } else {
+                self.hasher.hash_one(key).max(1)
+            }
+        } else {
+            // Fallback to standard hasher for other types
+            self.hasher.hash_one(key).max(1)
+        };
+
         let h2 = self.h2(h64);
         (h64, h2)
     }
 
     #[inline(always)]
     fn h1_mask(&self, hash64: u64, mask: usize) -> usize {
-        ((hash64 >> 7) as usize) & mask
+        if is_numeric_type::<K>() {
+            // Linear distribution for integers (like Go's intKey=true)
+            ((hash64 as usize) / ENTRIES_PER_BUCKET) & mask
+        } else {
+            // Shift distribution for strings and other types (like Go's intKey=false)
+            ((hash64 >> 7) as usize) & mask
+        }
     }
 
     #[inline(always)]
@@ -1555,13 +1642,15 @@ impl<K, V> Drop for Table<K, V> {
 // ================================================================================================
 
 // Provide idiomatic trait implementations to integrate with the Rust ecosystem.
-impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Default for FlatMap<K, V, S> {
+impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Default> Default
+    for FlatMap<K, V, S>
+{
     fn default() -> Self {
         Self::with_hasher(S::default())
     }
 }
 
-impl<'a, K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> IntoIterator
+impl<'a, K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Default> IntoIterator
     for &'a FlatMap<K, V, S>
 {
     type Item = (K, V);
@@ -1572,7 +1661,7 @@ impl<'a, K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> IntoIterator
     }
 }
 
-impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> FromIterator<(K, V)>
+impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Default> FromIterator<(K, V)>
     for FlatMap<K, V, S>
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
@@ -1584,7 +1673,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> FromIterator<(K, 
     }
 }
 
-impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Default> Extend<(K, V)> for FlatMap<K, V, S> {
+impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Default> Extend<(K, V)>
+    for FlatMap<K, V, S>
+{
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         for (k, v) in iter {
             let _ = self.insert(k, v);
