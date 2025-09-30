@@ -35,7 +35,7 @@ Comprehensive benchmarks comparing FlatMap with `std::collections::HashMap` and 
 
 | Test Scenario | FlatMap | HashMap+Mutex | DashMap | FlatMap Advantage |
 |---------------|---------|---------------|---------|-------------------|
-| **Single-Thread Insert** | 1,334M ops/sec | - | 353M ops/sec | **3.8x faster** |
+| **Multi-Thread Get** | 1,334M ops/sec | - | 353M ops/sec | **3.8x faster** |
 | **Multi-Thread Insert** (64 threads) | 98M ops/sec | - | 45M ops/sec | **2.2x faster** |
 | **Multi-Thread String Insert** (64 threads) | 20.8M ops/sec | 0.8M ops/sec | 12.8M ops/sec | **25x vs Mutex, 1.6x vs DashMap** |
 
