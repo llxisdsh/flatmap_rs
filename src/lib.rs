@@ -221,30 +221,16 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
 
         // Allocate buckets as raw pointer
         let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(len).unwrap();
-        let buckets_ptr = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
+        let buckets_ptr = unsafe { std::alloc::alloc_zeroed(buckets_layout) as *mut Bucket<K, V> };
         if buckets_ptr.is_null() {
             std::alloc::handle_alloc_error(buckets_layout);
         }
 
-        // Initialize buckets
-        for i in 0..len {
-            unsafe {
-                std::ptr::write(buckets_ptr.add(i), Bucket::new());
-            }
-        }
-
         // Allocate size as raw pointer
         let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
-        let size_ptr = unsafe { std::alloc::alloc(size_layout) as *mut AtomicUsize };
+        let size_ptr = unsafe { std::alloc::alloc_zeroed(size_layout) as *mut AtomicUsize };
         if size_ptr.is_null() {
             std::alloc::handle_alloc_error(size_layout);
-        }
-
-        // Initialize size
-        for i in 0..size_len {
-            unsafe {
-                std::ptr::write(size_ptr.add(i), AtomicUsize::new(0));
-            }
         }
 
         let table = Table {
@@ -522,7 +508,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
             root.lock();
 
             // Handle ongoing resize if a new table is ready
-            if self.resize_state.started.load(Ordering::Acquire)
+            if self.resize_state.started.load(Ordering::Relaxed)
                 && self.resize_state.is_new_table_ready()
             {
                 root.unlock();
@@ -583,7 +569,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                 let old_ref = entry.get_value();
                 let old_clone = old_ref.clone();
 
-                match f(Some(old_clone.clone())) {
+                return match f(Some(old_clone.clone())) {
                     Some(new_v) => {
                         // Update value under seqlock
                         let seq = bucket.seq.load(Ordering::Relaxed);
@@ -591,7 +577,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                         entry.val = MaybeUninit::new(new_v);
                         bucket.seq.store(seq + 2, Ordering::Release);
                         root.unlock();
-                        return Some(old_clone);
+                        Some(old_clone)
                     }
                     None => {
                         // Delete entry under seqlock
@@ -616,9 +602,9 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                         }
 
                         table.add_size(idx, -1);
-                        return Some(old_clone);
+                        Some(old_clone)
                     }
-                }
+                };
             }
 
             // Absent key path
@@ -769,16 +755,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         //     return;
         // }
 
-        // Try to start a new resize
-        // let old_table = self.table.seq_load();
-        // let old_len = old_table.mask() + 1;
-
-        // if hint == ResizeHint::Shrink {
-        //     if old_len <= MIN_TABLE_LEN {
-        //         return; // No shrink needed
-        //     }
-        // }
-
         // Try to acquire the resize lock by setting started to true
         match self.resize_state.started.compare_exchange(
             false,
@@ -787,11 +763,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                // Successfully started resize, set the hint
-                // unsafe {
-                //     *self.resize_state.hint.get() = hint;
-                // }
-
                 // Reset resize state fields
                 unsafe {
                     *self.resize_state.new_table.get() = None;
@@ -811,56 +782,29 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
     }
 
     fn finalize_resize(&self) {
-        // This method corresponds to Go's finalizeResize function
-        // It creates the new table and initiates the copy process
         let state = &self.resize_state;
         let old_table = self.table.seq_load();
         let old_len = old_table.mask() + 1;
 
-        let new_len = old_len << 1;
-        // Calculate new table length based on resize hint
-        // let new_len = match unsafe { &*state.hint.get() } {
-        //     ResizeHint::Grow => old_len * 2,
-        //     ResizeHint::Shrink => {
-        //         if old_len <= MIN_TABLE_LEN {
-        //             // Should not happen, but handle gracefully
-        //             state.started.store(false, Ordering::Release);
-        //             return;
-        //         }
-        //         old_len / 2
-        //     }
-        // };
+        let size = old_table.sum_size();
+        let new_len = calc_table_len(size).max(old_len << 1);
 
         // Calculate parallelism for the copy operation
-        let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get());
+        let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU);
 
         // Create the new table (this is where the actual allocation happens)
         let buckets_layout = std::alloc::Layout::array::<Bucket<K, V>>(new_len).unwrap();
-        let buckets = unsafe { std::alloc::alloc(buckets_layout) as *mut Bucket<K, V> };
+        let buckets = unsafe { std::alloc::alloc_zeroed(buckets_layout) as *mut Bucket<K, V> };
         if buckets.is_null() {
             std::alloc::handle_alloc_error(buckets_layout);
         }
 
-        // Initialize buckets
-        for i in 0..new_len {
-            unsafe {
-                std::ptr::write(buckets.add(i), Bucket::new());
-            }
-        }
-
         // Allocate and initialize size
-        let size_len = calc_size_len(new_len, num_cpus::get());
+        let size_len = calc_size_len(new_len, cpu_count());
         let size_layout = std::alloc::Layout::array::<AtomicUsize>(size_len).unwrap();
-        let size = unsafe { std::alloc::alloc(size_layout) as *mut AtomicUsize };
+        let size = unsafe { std::alloc::alloc_zeroed(size_layout) as *mut AtomicUsize };
         if size.is_null() {
             std::alloc::handle_alloc_error(size_layout);
-        }
-
-        // Initialize size
-        for i in 0..size_len {
-            unsafe {
-                std::ptr::write(size.add(i), AtomicUsize::new(0));
-            }
         }
 
         let new_table = Table {
@@ -880,9 +824,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         // Now call help_copy_and_wait to perform the actual data copying
         // help_copy_and_wait will handle the table swap and cleanup when all chunks are done
         self.help_copy_and_wait();
-
-        // Note: help_copy_and_wait handles table swap and resize_state cleanup
-        // The resize state will be cleaned up by the thread that completes the last chunk
     }
 
     fn help_copy_and_wait(&self) {
@@ -890,9 +831,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         if !state.started.load(Ordering::Acquire) {
             return;
         }
-
-        let old_table = self.table.seq_load();
-        let table_len = old_table.mask() + 1;
 
         // Get chunks first as an Acquire barrier to ensure visibility of new_table
         let chunks = state.chunks.load(Ordering::Acquire);
@@ -909,18 +847,20 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
             None => return, // New table not ready yet
         };
 
+        let old_table = &self.table;
+        let table_len = old_table.mask() + 1;
         // Calculate chunk size
         let chunk_sz = (table_len + chunks as usize - 1) / chunks as usize;
-        // let is_growth = (new_table.mask() + 1) > table_len;
 
         // Work loop - similar to Go's for loop
         loop {
             // fetch_add returns the previous value, so we need to add 1 to get the current process number
             let process_prev = state.process.fetch_add(1, Ordering::Relaxed);
             if process_prev >= chunks {
+                let mut spins = 0;
                 // No more work, wait for completion
-                while state.started.load(Ordering::Acquire) {
-                    thread::yield_now();
+                while state.started.load(Ordering::Relaxed) {
+                    delay(&mut spins)
                 }
                 return;
             }
@@ -933,13 +873,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
             let _end = std::cmp::min(start + chunk_sz, table_len);
 
             // Copy the chunk - pass is_growth parameter to determine locking strategy
-            self.copy_chunk(
-                &old_table,
-                new_table,
-                process0 as usize,
-                chunks as usize,
-                // is_growth,
-            );
+            self.copy_chunk(&old_table, new_table, process0 as usize, chunks as usize);
 
             // Mark chunk as completed
             let completed = state.completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -981,97 +915,100 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         let chunk_size = (old_len + total_chunks - 1) / total_chunks; // Ceiling division
         let start = chunk_id * chunk_size;
         let end = std::cmp::min(start + chunk_size, old_len);
-        let mut total_copied = 0;
+        let total_copied = self.copy_bucket(old_table, start, end, new_table);
 
-        for i in start..end {
-            total_copied += self.copy_bucket(old_table.get_bucket(i), new_table);
-        }
         // Update size in batch like Go's AddSize(start, copied)
         if total_copied > 0 {
             new_table.add_size(start, total_copied as isize);
         }
     }
 
-    fn copy_bucket(&self, bucket: &Bucket<K, V>, new_table: &Table<K, V>) -> usize
+    fn copy_bucket(
+        &self,
+        old_table: &Table<K, V>,
+        start: usize,
+        end: usize,
+        new_table: &Table<K, V>,
+    ) -> usize
     where
         K: Clone + Eq + Hash,
         V: Clone,
     {
-        // Lock the source bucket to stabilize the chain
-        bucket.lock();
-
         let mut copied = 0;
-        let mut current = bucket;
-        loop {
-            let entries_ref = current.get_entries();
-            let meta = current.meta.load(Ordering::Relaxed);
-            let mut marked = meta & META_MASK;
+        for i in start..end {
+            let bucket = old_table.get_bucket(i);
+            // Lock the source bucket to stabilize the chain
+            bucket.lock();
 
-            while marked != 0 {
-                let j = first_marked_byte_index(marked);
-                let entry = &entries_ref[j];
+            let mut current = bucket;
+            loop {
+                let entries_ref = current.get_entries();
+                let meta = current.meta.load(Ordering::Relaxed);
+                let mut marked = meta & META_MASK;
 
-                // Check if slot is marked as occupied and entry is occupied
-                let (key, val) = entry.clone_key_value();
-                let hash64 = entry.hash;
-                // Extract h2 directly from meta instead of recalculating
-                let h2 = ((meta >> (j * 8)) & 0xFF) as u8;
-                // let h2 = self.h2(hash64);
+                while marked != 0 {
+                    let j = first_marked_byte_index(marked);
+                    let entry = &entries_ref[j];
 
-                // For shrink operations, lock destination bucket during insertion
-                let idx = self.h1_mask(hash64, new_table.mask());
-                let dest_bucket = new_table.get_bucket(idx);
-                // dest_bucket.lock();
+                    let hash64 = entry.hash;
+                    // Extract h2 directly from meta instead of recalculating
+                    let h2 = ((meta >> (j * 8)) & 0xFF) as u8;
 
-                // Direct insertion into destination bucket (like Go's appendTo loop)
-                let mut current_dest = dest_bucket;
-                'append_to: loop {
-                    let dest_meta = current_dest.meta.load(Ordering::Relaxed);
-                    let empty = (!dest_meta) & META_MASK;
+                    // Use unsafe clone to avoid double-checking initialization
+                    let (key, val) = unsafe { entry.unsafe_clone_key_value() };
 
-                    if empty != 0 {
-                        // Found empty slot
-                        let empty_idx = first_marked_byte_index(empty);
-                        let new_meta = set_byte(dest_meta, h2, empty_idx);
+                    // Direct insertion into destination bucket (like Go's appendTo loop)
+                    let idx = self.h1_mask(hash64, new_table.mask());
+                    let dest_bucket = new_table.get_bucket(idx);
+                    let mut current_dest = dest_bucket;
 
-                        unsafe {
-                            // Follow Go's order: meta first, then value, hash, key
-                            current_dest.meta.store(new_meta, Ordering::Relaxed);
-                            let dest_entries = &mut *current_dest.entries.get();
-                            dest_entries[empty_idx].val.as_mut_ptr().write(val.clone());
-                            dest_entries[empty_idx].set_hash(hash64);
-                            dest_entries[empty_idx].key.as_mut_ptr().write(key.clone());
+                    'append_to: loop {
+                        let dest_meta = current_dest.meta.load(Ordering::Relaxed);
+                        let empty = (!dest_meta) & META_MASK;
+
+                        if empty != 0 {
+                            // Found empty slot
+                            let empty_idx = first_marked_byte_index(empty);
+                            let new_meta = set_byte(dest_meta, h2, empty_idx);
+
+                            unsafe {
+                                // Follow Go's order: meta first, then value, hash, key
+                                current_dest.meta.store(new_meta, Ordering::Relaxed);
+                                let dest_entries = &mut *current_dest.entries.get();
+                                dest_entries[empty_idx].val.as_mut_ptr().write(val);
+                                dest_entries[empty_idx].set_hash(hash64);
+                                dest_entries[empty_idx].key.as_mut_ptr().write(key);
+                            }
+                            break 'append_to;
                         }
-                        break 'append_to;
+
+                        // No empty slot, check for next bucket
+                        let next_ptr = current_dest.next.load(Ordering::Relaxed);
+                        if next_ptr.is_null() {
+                            // Create new overflow bucket
+                            let new_ptr = Bucket::alloc_single(hash64, h2, key, val);
+
+                            current_dest.next.store(new_ptr, Ordering::Relaxed);
+                            break 'append_to;
+                        } else {
+                            current_dest = unsafe { &*next_ptr };
+                        }
                     }
 
-                    // No empty slot, check for next bucket
-                    let next_ptr = current_dest.next.load(Ordering::Relaxed);
-                    if next_ptr.is_null() {
-                        // Create new overflow bucket
-                        let new_ptr = Bucket::alloc_single(hash64, h2, key.clone(), val.clone());
-                        current_dest.next.store(new_ptr, Ordering::Relaxed);
-
-                        break 'append_to;
-                    } else {
-                        current_dest = unsafe { &*next_ptr };
-                    }
+                    copied += 1;
+                    marked &= marked - 1;
                 }
 
-                // dest_bucket.unlock();
-                copied += 1;
-                marked &= marked - 1;
+                // Move to next bucket in chain
+                let next_ptr = current.next.load(Ordering::Relaxed);
+                if next_ptr.is_null() {
+                    break;
+                }
+                current = unsafe { &*next_ptr };
             }
 
-            // Move to next bucket in chain
-            let next_ptr = current.next.load(Ordering::Relaxed);
-            if next_ptr.is_null() {
-                break;
-            }
-            current = unsafe { &*next_ptr };
+            bucket.unlock();
         }
-
-        bucket.unlock();
         copied
     }
 
@@ -1154,38 +1091,37 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
 // ================================================================================================
 
 impl<K, V> Bucket<K, V> {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            seq: AtomicU64::new(0),
-            meta: AtomicU64::new(0),
-            next: AtomicPtr::new(std::ptr::null_mut()),
-            entries: UnsafeCell::new(std::array::from_fn(|_| Entry::default())),
-        }
-    }
-
-    #[inline(always)]
-    fn single(_hash: u64, h2: u8, key: K, val: V) -> Self {
-        let b = Self::new();
-        unsafe {
-            let entries = &mut *b.entries.get();
-            entries[0].set_hash(_hash); // Always set hash for occupancy checking
-            entries[0].key.as_mut_ptr().write(key);
-            entries[0].val.as_mut_ptr().write(val);
-        }
-        b.meta.store(set_byte(0, h2, 0), Ordering::Relaxed);
-        b
-    }
+    //#[inline(always)]
+    // fn new() -> Self {
+    //     Self {
+    //         seq: AtomicU64::new(0),
+    //         meta: AtomicU64::new(0),
+    //         next: AtomicPtr::new(std::ptr::null_mut()),
+    //         entries: UnsafeCell::new(std::array::from_fn(|_| Entry::default())),
+    //     }
+    // }
 
     #[inline(always)]
     fn alloc_single(hash: u64, h2: u8, key: K, val: V) -> *mut Bucket<K, V> {
         unsafe {
             let layout = std::alloc::Layout::new::<Bucket<K, V>>();
-            let ptr = std::alloc::alloc(layout) as *mut Bucket<K, V>;
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Bucket<K, V>;
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            std::ptr::write(ptr, Bucket::single(hash, h2, key, val));
+
+            let bucket = &mut *ptr;
+
+            // Set meta to mark the first slot as occupied
+            // bucket.meta.store(set_byte(0, h2, 0), Ordering::Relaxed);
+            std::ptr::write(&mut bucket.meta, AtomicU64::from(set_byte(0, h2, 0)));
+
+            // Set the first entry with our data
+            let entries = &mut *bucket.entries.get();
+            entries[0].set_hash(hash);
+            entries[0].key.as_mut_ptr().write(key);
+            entries[0].val.as_mut_ptr().write(val);
+
             ptr
         }
     }
@@ -1483,23 +1419,23 @@ impl<K, V> Entry<K, V> {
     }
 
     /// Safe cloned key-value pair access for occupied entries
-    #[inline(always)]
-    fn clone_key_value(&self) -> (K, V)
-    where
-        K: Clone,
-        V: Clone,
-    {
-        // debug_assert!(
-        //     self.is_occupied(),
-        //     "Entry must be occupied to clone key-value"
-        // );
-        unsafe {
-            (
-                self.key.assume_init_ref().clone(),
-                self.val.assume_init_ref().clone(),
-            )
-        }
-    }
+    // #[inline(always)]
+    // fn clone_key_value(&self) -> (K, V)
+    // where
+    //     K: Clone,
+    //     V: Clone,
+    // {
+    //     // debug_assert!(
+    //     //     self.is_occupied(),
+    //     //     "Entry must be occupied to clone key-value"
+    //     // );
+    //     unsafe {
+    //         (
+    //             self.key.assume_init_ref().clone(),
+    //             self.val.assume_init_ref().clone(),
+    //         )
+    //     }
+    // }
 
     /// Unsafe clone for concurrent access - caller must ensure entry is occupied
     #[inline(always)]
@@ -1701,14 +1637,9 @@ fn calc_size_len(table_len: usize, cpus: usize) -> usize {
 }
 
 /// Calculate parallelism for resize operations
-fn calc_parallelism(
-    table_len: usize,
-    min_buckets_per_cpu: usize,
-    max_cpus: usize,
-) -> (usize, usize) {
+fn calc_parallelism(table_len: usize, min_buckets_per_cpu: usize) -> (usize, usize) {
     let cpus = cpu_count();
-    let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
-    let max_workers = over_cpus.min(max_cpus);
+    let max_workers = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
     let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
     (max_workers, chunks)
 }
@@ -1750,6 +1681,7 @@ fn delay(spins: &mut i32) {
     if !try_spin(spins) {
         *spins = 0;
         thread::yield_now();
+        //thread::sleep(Duration::from_micros(500));
     }
 }
 

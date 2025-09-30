@@ -469,7 +469,7 @@ fn test_multi_thread_sequential_insert() -> Vec<PerformanceResult> {
 
     // FlatMap 测试
     {
-        let flatmap = Arc::new(FlatMap::<u64, u64>::with_capacity(TOTAL_OPERATIONS));
+        let flatmap = Arc::new(FlatMap::<u64, u64>::new());
         let start = Instant::now();
 
         let handles: Vec<_> = (0..num_threads)
@@ -502,42 +502,42 @@ fn test_multi_thread_sequential_insert() -> Vec<PerformanceResult> {
         ));
     }
 
-    // HashMap + Mutex 测试
-    {
-        let hashmap = Arc::new(Mutex::new(HashMap::new()));
-        let start = Instant::now();
+    // // HashMap + Mutex 测试
+    // {
+    //     let hashmap = Arc::new(Mutex::new(HashMap::new()));
+    //     let start = Instant::now();
 
-        let handles: Vec<_> = (0..num_threads)
-            .map(|i| {
-                let hashmap = Arc::clone(&hashmap);
-                let start_idx = i * batch_size;
-                let end_idx = if i == num_threads - 1 {
-                    TOTAL_OPERATIONS
-                } else {
-                    (i + 1) * batch_size
-                };
+    //     let handles: Vec<_> = (0..num_threads)
+    //         .map(|i| {
+    //             let hashmap = Arc::clone(&hashmap);
+    //             let start_idx = i * batch_size;
+    //             let end_idx = if i == num_threads - 1 {
+    //                 TOTAL_OPERATIONS
+    //             } else {
+    //                 (i + 1) * batch_size
+    //             };
 
-                thread::spawn(move || {
-                    for j in start_idx..end_idx {
-                        if let Ok(mut map) = hashmap.lock() {
-                            map.insert(j as u64, j as u64);
-                        }
-                    }
-                })
-            })
-            .collect();
+    //             thread::spawn(move || {
+    //                 for j in start_idx..end_idx {
+    //                     if let Ok(mut map) = hashmap.lock() {
+    //                         map.insert(j as u64, j as u64);
+    //                     }
+    //                 }
+    //             })
+    //         })
+    //         .collect();
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+    //     for handle in handles {
+    //         handle.join().unwrap();
+    //     }
 
-        let duration = start.elapsed();
-        results.push(PerformanceResult::new(
-            "HashMap+Mutex".to_string(),
-            TOTAL_OPERATIONS,
-            duration,
-        ));
-    }
+    //     let duration = start.elapsed();
+    //     results.push(PerformanceResult::new(
+    //         "HashMap+Mutex".to_string(),
+    //         TOTAL_OPERATIONS,
+    //         duration,
+    //     ));
+    // }
 
     // DashMap 测试
     {
@@ -959,7 +959,7 @@ fn main() {
     println!("CPU 核心数: {}", num_cpus::get());
     println!();
 
-    // 运行所有测试
+    // // 运行所有测试
     let single_insert_results = test_single_thread_insert();
     print_results("单线程插入吞吐量测试结果", &single_insert_results);
 
@@ -973,10 +973,7 @@ fn main() {
     );
 
     let single_string_results = test_single_thread_string_insert();
-    print_results(
-        "单线程顺序数字转字符串插入吞吐量测试结果",
-        &single_string_results,
-    );
+    print_results("单线程字符串插入吞吐量测试结果", &single_string_results);
 
     let multi_insert_results = test_multi_thread_insert();
     print_results("多线程插入吞吐量测试结果", &multi_insert_results);
