@@ -839,10 +839,18 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
             // For string types, use optimized string hash
             if std::any::TypeId::of::<K>() == std::any::TypeId::of::<String>() {
                 let s = unsafe { &*(key as *const K as *const String) };
-                fast_hash_string(s).0
+                if s.len() <= 12 {
+                    fast_hash_string(s).0
+                } else {
+                    self.hasher.hash_one(key)
+                }
             } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<&str>() {
                 let s = unsafe { *(key as *const K as *const &str) };
-                fast_hash_string(s).0
+                if s.len() <= 12 {
+                    fast_hash_string(s).0
+                } else {
+                    self.hasher.hash_one(key)
+                }
             } else {
                 self.hasher.hash_one(key)
             }
