@@ -39,7 +39,7 @@ const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000;
 
 // Parallel resize constants
 /// Minimum buckets per CPU thread
-const MIN_BUCKETS_PER_CPU: usize = 64;
+const MIN_BUCKETS_PER_CPU: usize = 16;
 
 /// Over-partition factor for resize to reduce tail latency
 const RESIZE_OVER_PARTITION: usize = 4;
@@ -756,11 +756,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
-        use std::hash::Hasher;
-        let mut h = self.hasher.build_hasher();
-        key.hash(&mut h);
-        let hv = h.finish().max(1);
-        (hv, self.h2(hv))
+        let h64 = self.hasher.hash_one(key).max(1);
+        let h2 = self.h2(h64);
+        (h64, h2)
     }
 
     #[inline(always)]
@@ -1663,10 +1661,7 @@ fn try_spin(spins: &mut i32) -> bool {
 
 #[inline(always)]
 fn delay(spins: &mut i32) {
-    if *spins < SPIN_BEFORE_YIELD {
-        *spins += *spins + 1;
-        std::hint::spin_loop();
-    } else {
+    if !try_spin(spins) {
         *spins = 0;
         thread::yield_now();
     }
