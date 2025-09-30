@@ -786,9 +786,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     fn try_resize(&self, hint: ResizeHint) {
         // Check if resize is already in progress using the started flag
-        if self.resize_state.started.load(Ordering::Acquire) {
-            return;
-        }
+        // if self.resize_state.started.load(Ordering::Relaxed) {
+        //     return;
+        // }
 
         // Try to start a new resize
         let old_table = self.table.seq_load();
@@ -817,18 +817,16 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 unsafe {
                     *self.resize_state.new_table.get() = None;
                 }
+                self.resize_state.process.store(0, Ordering::Relaxed);
+                self.resize_state.completed.store(0, Ordering::Relaxed);
                 self.resize_state.chunks.store(0, Ordering::Release);
-                self.resize_state.process.store(0, Ordering::Release);
-                self.resize_state.completed.store(0, Ordering::Release);
 
                 // Call finalize_resize which will create the new table and call help_copy_and_wait
                 self.finalize_resize();
             }
             Err(_) => {
                 // Another thread started resize, help with the current resize
-                // unsafe {
-                //     self.help_copy_and_wait(&self.resize_state);
-                // }
+                // self.help_copy_and_wait();
             }
         }
     }
@@ -964,7 +962,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             );
 
             // Mark chunk as completed
-            let completed = state.completed.fetch_add(1, Ordering::AcqRel) + 1;
+            let completed = state.completed.fetch_add(1, Ordering::Relaxed) + 1;
             if completed == chunks {
                 // All chunks completed, finalize the table swap using seqlock
                 let new_table_copy = unsafe { (*state.new_table.get()).as_ref().unwrap().clone() };
@@ -1146,7 +1144,7 @@ impl<K, V> Bucket<K, V> {
             if (cur & OP_LOCK_MASK) == 0 {
                 if self
                     .meta
-                    .compare_exchange(
+                    .compare_exchange_weak(
                         cur,
                         cur | OP_LOCK_MASK,
                         Ordering::Acquire,
