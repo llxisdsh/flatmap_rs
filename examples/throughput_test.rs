@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const TEST_DURATION: Duration = Duration::from_secs(1);
 const WARMUP_OPERATIONS: usize = 10_000;
+const TOTAL_OPERATIONS: usize = 10_000_000; // 1千万数据
 
 // 生成测试数据
 fn generate_test_data(size: usize) -> Vec<(u64, u64)> {
@@ -232,6 +233,65 @@ fn test_single_thread_read() -> Vec<PerformanceResult> {
     results
 }
 
+// 单线程顺序数字插入测试
+fn test_single_thread_sequential_insert() -> Vec<PerformanceResult> {
+    println!("=== 单线程顺序数字插入吞吐量测试 (插入{}条数据) ===", TOTAL_OPERATIONS);
+    let mut results = Vec::new();
+
+    // FlatMap 测试
+    {
+        let flatmap = FlatMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            flatmap.insert(i as u64, i as u64);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "FlatMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // HashMap 测试
+    {
+        let mut hashmap = HashMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            hashmap.insert(i as u64, i as u64);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "HashMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // DashMap 测试
+    {
+        let dashmap = DashMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            dashmap.insert(i as u64, i as u64);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "DashMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    results
+}
+
 // 多线程插入测试
 fn test_multi_thread_insert() -> Vec<PerformanceResult> {
     let num_threads = num_cpus::get();
@@ -387,6 +447,123 @@ fn test_multi_thread_insert() -> Vec<PerformanceResult> {
         results.push(PerformanceResult::new(
             "DashMap".to_string(),
             total_ops,
+            duration,
+        ));
+    }
+
+    results
+}
+
+// 多线程顺序数字插入测试
+fn test_multi_thread_sequential_insert() -> Vec<PerformanceResult> {
+    let num_threads = num_cpus::get();
+    println!("=== 多线程顺序数字插入吞吐量测试 ({} 线程，插入{}条数据) ===", num_threads, TOTAL_OPERATIONS);
+    let mut results = Vec::new();
+    let batch_size = TOTAL_OPERATIONS / num_threads;
+
+    // FlatMap 测试
+    {
+        let flatmap = Arc::new(FlatMap::new());
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let flatmap = Arc::clone(&flatmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        flatmap.insert(j as u64, j as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "FlatMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // HashMap + Mutex 测试
+    {
+        let hashmap = Arc::new(Mutex::new(HashMap::new()));
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let hashmap = Arc::clone(&hashmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        if let Ok(mut map) = hashmap.lock() {
+                            map.insert(j as u64, j as u64);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "HashMap+Mutex".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // DashMap 测试
+    {
+        let dashmap = Arc::new(DashMap::new());
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let dashmap = Arc::clone(&dashmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        dashmap.insert(j as u64, j as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "DashMap".to_string(),
+            TOTAL_OPERATIONS,
             duration,
         ));
     }
@@ -556,6 +733,188 @@ fn test_multi_thread_read() -> Vec<PerformanceResult> {
     results
 }
 
+// 单线程顺序数字转字符串插入测试
+fn test_single_thread_string_insert() -> Vec<PerformanceResult> {
+    println!("=== 单线程顺序数字转字符串插入吞吐量测试 (插入{}条数据) ===", TOTAL_OPERATIONS);
+    let mut results = Vec::new();
+
+    // FlatMap 测试
+    {
+        let flatmap = FlatMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            let key = i.to_string();
+            flatmap.insert(key, i);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "FlatMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // HashMap 测试
+    {
+        let mut hashmap = HashMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            let key = i.to_string();
+            hashmap.insert(key, i);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "HashMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // DashMap 测试
+    {
+        let dashmap = DashMap::new();
+        let start = Instant::now();
+
+        for i in 0..TOTAL_OPERATIONS {
+            let key = i.to_string();
+            dashmap.insert(key, i);
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "DashMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    results
+}
+
+// 多线程顺序数字转字符串插入测试
+fn test_multi_thread_string_insert() -> Vec<PerformanceResult> {
+    let num_threads = num_cpus::get();
+    println!("=== 多线程顺序数字转字符串插入吞吐量测试 ({} 线程，插入{}条数据) ===", num_threads, TOTAL_OPERATIONS);
+    let mut results = Vec::new();
+    let batch_size = TOTAL_OPERATIONS / num_threads;
+
+    // FlatMap 测试
+    {
+        let flatmap = Arc::new(FlatMap::new());
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let flatmap = Arc::clone(&flatmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        let key = j.to_string();
+                        flatmap.insert(key, j);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "FlatMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // HashMap + Mutex 测试
+    {
+        let hashmap = Arc::new(Mutex::new(HashMap::new()));
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let hashmap = Arc::clone(&hashmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        let key = j.to_string();
+                        if let Ok(mut map) = hashmap.lock() {
+                            map.insert(key, j);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "HashMap+Mutex".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    // DashMap 测试
+    {
+        let dashmap = Arc::new(DashMap::new());
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let dashmap = Arc::clone(&dashmap);
+                let start_idx = i * batch_size;
+                let end_idx = if i == num_threads - 1 {
+                    TOTAL_OPERATIONS
+                } else {
+                    (i + 1) * batch_size
+                };
+
+                thread::spawn(move || {
+                    for j in start_idx..end_idx {
+                        let key = j.to_string();
+                        dashmap.insert(key, j);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        results.push(PerformanceResult::new(
+            "DashMap".to_string(),
+            TOTAL_OPERATIONS,
+            duration,
+        ));
+    }
+
+    results
+}
+
 // 打印测试结果
 fn print_results(title: &str, results: &[PerformanceResult]) {
     println!("\n{}", title);
@@ -595,11 +954,23 @@ fn main() {
     let single_read_results = test_single_thread_read();
     print_results("单线程读取吞吐量测试结果", &single_read_results);
 
+    let single_sequential_results = test_single_thread_sequential_insert();
+    print_results("单线程顺序数字插入吞吐量测试结果", &single_sequential_results);
+
+    let single_string_results = test_single_thread_string_insert();
+    print_results("单线程顺序数字转字符串插入吞吐量测试结果", &single_string_results);
+
     let multi_insert_results = test_multi_thread_insert();
     print_results("多线程插入吞吐量测试结果", &multi_insert_results);
 
     let multi_read_results = test_multi_thread_read();
     print_results("多线程读取吞吐量测试结果", &multi_read_results);
+
+    let multi_sequential_results = test_multi_thread_sequential_insert();
+    print_results("多线程顺序数字插入吞吐量测试结果", &multi_sequential_results);
+
+    let multi_string_results = test_multi_thread_string_insert();
+    print_results("多线程顺序数字转字符串插入吞吐量测试结果", &multi_string_results);
 
     // 总结
     println!("=== 性能总结 ===");
@@ -620,6 +991,22 @@ fn main() {
             .name
     );
     println!(
+        "单线程顺序数字插入最佳: {}",
+        single_sequential_results
+            .iter()
+            .max_by_key(|r| r.operations_per_second)
+            .unwrap()
+            .name
+    );
+    println!(
+        "单线程字符串插入最佳: {}",
+        single_string_results
+            .iter()
+            .max_by_key(|r| r.operations_per_second)
+            .unwrap()
+            .name
+    );
+    println!(
         "多线程插入最佳: {}",
         multi_insert_results
             .iter()
@@ -630,6 +1017,22 @@ fn main() {
     println!(
         "多线程读取最佳: {}",
         multi_read_results
+            .iter()
+            .max_by_key(|r| r.operations_per_second)
+            .unwrap()
+            .name
+    );
+    println!(
+        "多线程顺序数字插入最佳: {}",
+        multi_sequential_results
+            .iter()
+            .max_by_key(|r| r.operations_per_second)
+            .unwrap()
+            .name
+    );
+    println!(
+        "多线程字符串插入最佳: {}",
+        multi_string_results
             .iter()
             .max_by_key(|r| r.operations_per_second)
             .unwrap()
