@@ -68,7 +68,6 @@ pub enum Op {
 enum ResizeHint {
     Grow,
     Shrink,
-    Clear,
 }
 // ================================================================================================
 // INTERNAL DATA STRUCTURES
@@ -509,7 +508,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
     /// Removes all key-value pairs from the map.
     pub fn clear(&self) {
-        self.try_resize(ResizeHint::Clear);
+        self.range_process(|_, _| (Op::Delete, None));
     }
 
     // ============================================================================================
@@ -936,7 +935,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
                 old_len / 2
             }
-            ResizeHint::Clear => MIN_TABLE_LEN,
         };
 
         // Calculate parallelism for the copy operation
@@ -978,23 +976,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             size_mask: UnsafeCell::new((size_len - 1) as u32),
             seq: AtomicU32::new(2), // Set to 2 to indicate initialization is complete
         };
-
-        if unsafe { *state.hint.get() } == ResizeHint::Clear {
-            // Store old table for cleanup
-            let old_table_copy = self.table.seq_load();
-            unsafe {
-                let old_tables = &mut *self.old_tables.get();
-                old_tables.push(Box::new(old_table_copy));
-            }
-
-            // Swap to new empty table using seqlock
-            self.table.seq_store(&new_table);
-
-            // Clear resize state
-            state.started.store(false, Ordering::Release);
-
-            return;
-        }
 
         // Store new table first, then publish via chunks with Release
         unsafe {
