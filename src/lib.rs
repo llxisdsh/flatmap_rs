@@ -478,33 +478,12 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     ///         in the map. If the closure returns false for any pair, the iteration will
     ///         be stopped.
     pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
-        // Optimized version: call user closure directly in lock to avoid Vec allocation
-        let table = self.table.seq_load();
-        'outer: for i in 0..(table.mask() + 1) {
-            let root = table.get_bucket(i);
-            root.lock();
-            let mut bucket_opt = Some(root);
-            while let Some(b) = bucket_opt {
-                let entries_ref = b.get_entries();
-                let meta = b.meta.load(Ordering::Relaxed);
-                let mut marked = meta & META_MASK;
-                while marked != 0 {
-                    let j = first_marked_byte_index(marked);
-                    let e = &entries_ref[j];
-                    // Only access key/value if slot is marked as occupied in meta
-                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                        let (k, v) = unsafe { e.unsafe_clone_key_value() };
-                        // Call user closure directly while holding lock
-                        if !f(&k, &v) {
-                            root.unlock();
-                            break 'outer;
-                        }
-                    }
-                    marked &= marked - 1;
-                }
-                bucket_opt = b.get_next_bucket_relaxed();
+        // Unified with iterator semantics: avoid calling user closure under locks.
+        // Iterate over a table snapshot and call f after data is cloned and locks released.
+        for (k, v) in self.iter() {
+            if !f(&k, &v) {
+                break;
             }
-            root.unlock();
         }
     }
 
