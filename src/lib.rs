@@ -1792,6 +1792,58 @@ fn delay(spins: &mut i32) {
     }
 }
 
+// Unified per-bucket collector used by KeysIterator/ValuesIterator/IterIterator
+// Clones the requested item type lazily, bucket by bucket, avoiding large allocations.
+fn collect_next_bucket<K, V, S, T, F>(
+    map: &FlatMap<K, V, S>,
+    bucket_index: &mut usize,
+    entries_collected: &mut Vec<T>,
+    mut make: F,
+) -> bool
+where
+    K: Clone,
+    V: Clone,
+    S: BuildHasher,
+    F: FnMut(&Entry<K, V>, u64, usize) -> Option<T>,
+{
+    let table = map.table.seq_load();
+
+    while *bucket_index <= table.mask() {
+        let root = table.get_bucket(*bucket_index);
+        root.lock();
+
+        let mut bucket_opt = Some(root);
+        entries_collected.clear();
+
+        while let Some(b) = bucket_opt {
+            let entries_ref = b.get_entries();
+            let meta = b.meta.load(Ordering::Relaxed);
+            let mut marked = meta & META_MASK;
+
+            while marked != 0 {
+                let j = first_marked_byte_index(marked);
+                let e = &entries_ref[j];
+                // Only access key/value if slot is marked as occupied in meta
+                if (meta >> (j * 8)) & SLOT_MASK != 0 {
+                    if let Some(item) = make(e, meta, j) {
+                        entries_collected.push(item);
+                    }
+                }
+                marked &= marked - 1;
+            }
+            bucket_opt = b.get_next_bucket_relaxed();
+        }
+
+        root.unlock();
+        *bucket_index += 1;
+
+        if !entries_collected.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Iterator over the keys of a FlatMap
 pub struct KeysIterator<K, V, S = RandomState>
 where
@@ -1820,41 +1872,14 @@ where
 
     fn collect_bucket_keys(&mut self) -> bool {
         let map = unsafe { &*self.map };
-        let table = map.table.seq_load();
-
-        while self.bucket_index <= table.mask() {
-            let root = table.get_bucket(self.bucket_index);
-            root.lock();
-
-            let mut bucket_opt = Some(root);
-            self.entries_collected.clear();
-
-            while let Some(b) = bucket_opt {
-                let entries_ref = b.get_entries();
-                let meta = b.meta.load(Ordering::Relaxed);
-                let mut marked = meta & META_MASK;
-
-                while marked != 0 {
-                    let j = first_marked_byte_index(marked);
-                    let e = &entries_ref[j];
-                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                        let (k, _) = unsafe { e.unsafe_clone_key_value() };
-                        self.entries_collected.push(k);
-                    }
-                    marked &= marked - 1;
-                }
-                bucket_opt = b.get_next_bucket_relaxed();
-            }
-
-            root.unlock();
-            self.bucket_index += 1;
-
-            if !self.entries_collected.is_empty() {
-                self.entries_index = 0;
-                return true;
-            }
+        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+            let (k, _) = unsafe { e.unsafe_clone_key_value() };
+            Some(k)
+        });
+        if ok {
+            self.entries_index = 0;
         }
-        false
+        ok
     }
 }
 
@@ -1909,41 +1934,14 @@ where
 
     fn collect_bucket_values(&mut self) -> bool {
         let map = unsafe { &*self.map };
-        let table = map.table.seq_load();
-
-        while self.bucket_index <= table.mask() {
-            let root = table.get_bucket(self.bucket_index);
-            root.lock();
-
-            let mut bucket_opt = Some(root);
-            self.entries_collected.clear();
-
-            while let Some(b) = bucket_opt {
-                let entries_ref = b.get_entries();
-                let meta = b.meta.load(Ordering::Relaxed);
-                let mut marked = meta & META_MASK;
-
-                while marked != 0 {
-                    let j = first_marked_byte_index(marked);
-                    let e = &entries_ref[j];
-                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                        let (_, v) = unsafe { e.unsafe_clone_key_value() };
-                        self.entries_collected.push(v);
-                    }
-                    marked &= marked - 1;
-                }
-                bucket_opt = b.get_next_bucket_relaxed();
-            }
-
-            root.unlock();
-            self.bucket_index += 1;
-
-            if !self.entries_collected.is_empty() {
-                self.entries_index = 0;
-                return true;
-            }
+        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+            let (_, v) = unsafe { e.unsafe_clone_key_value() };
+            Some(v)
+        });
+        if ok {
+            self.entries_index = 0;
         }
-        false
+        ok
     }
 }
 
@@ -1998,41 +1996,14 @@ where
 
     fn collect_bucket_pairs(&mut self) -> bool {
         let map = unsafe { &*self.map };
-        let table = map.table.seq_load();
-
-        while self.bucket_index <= table.mask() {
-            let root = table.get_bucket(self.bucket_index);
-            root.lock();
-
-            let mut bucket_opt = Some(root);
-            self.entries_collected.clear();
-
-            while let Some(b) = bucket_opt {
-                let entries_ref = b.get_entries();
-                let meta = b.meta.load(Ordering::Relaxed);
-                let mut marked = meta & META_MASK;
-
-                while marked != 0 {
-                    let j = first_marked_byte_index(marked);
-                    let e = &entries_ref[j];
-                    if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                        let (k, v) = unsafe { e.unsafe_clone_key_value() };
-                        self.entries_collected.push((k, v));
-                    }
-                    marked &= marked - 1;
-                }
-                bucket_opt = b.get_next_bucket_relaxed();
-            }
-
-            root.unlock();
-            self.bucket_index += 1;
-
-            if !self.entries_collected.is_empty() {
-                self.entries_index = 0;
-                return true;
-            }
+        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+            let (k, v) = unsafe { e.unsafe_clone_key_value() };
+            Some((k, v))
+        });
+        if ok {
+            self.entries_index = 0;
         }
-        false
+        ok
     }
 }
 
