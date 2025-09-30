@@ -327,10 +327,9 @@ fn key_torn_read_stress() {
         let s = stop.clone();
         handles.push(thread::spawn(move || {
             while !s.load(std::sync::atomic::Ordering::Relaxed) {
-                map.range(|k, _| {
+                for k in map.keys() {
                     assert_eq!(k.b, !k.a, "torn key detected: a={}, b={}", k.a, k.b);
-                    true
-                });
+                }
             }
         }));
     }

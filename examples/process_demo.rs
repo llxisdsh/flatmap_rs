@@ -9,10 +9,9 @@ fn main() {
     map.insert(3, 30);
 
     println!("Initial map:");
-    map.range(|k, v| {
+    for (k, v) in map.iter() {
         println!("  {} -> {}", k, v);
-        true // continue iteration
-    });
+    }
 
     // Process key 2: increment its value if it exists, otherwise insert 10
     let (old_val, new_val) = map.process(2, |old| match old {
@@ -34,8 +33,7 @@ fn main() {
     println!("\nRangeProcess processed {} entries", count);
 
     println!("\nFinal map:");
-    map.range(|k, v| {
+    for (k, v) in map.iter() {
         println!("  {} -> {}", k, v);
-        true // continue iteration
-    });
+    }
 }

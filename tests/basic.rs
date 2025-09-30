@@ -55,11 +55,11 @@ fn test_for_each_traversal() {
 
     let mut sum_keys = 0u64;
     let mut sum_vals = 0u64;
-    m.range(|k, v| {
-        sum_keys += *k;
-        sum_vals += *v;
-        true
-    });
+
+    for (k, v) in m.iter() {
+        sum_keys += k;
+        sum_vals += v;
+    }
 
     assert_eq!(sum_keys, (0..50).sum());
     assert_eq!(sum_vals, (0..50).map(|i| i * 2).sum());
@@ -167,10 +167,12 @@ fn test_for_each_early_termination() {
     }
 
     let mut count = 0;
-    m.range(|_k, _v| {
+    for _ in m.keys() {
         count += 1;
-        count < 5 // stop after 5
-    });
+        if count >= 5 {
+            break;
+        }
+    }
     assert_eq!(count, 5);
 }
 

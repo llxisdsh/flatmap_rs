@@ -3,12 +3,12 @@
 
 use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
-use std::marker::PhantomData;
 
 use ahash::RandomState;
 
@@ -465,25 +465,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             (new, false)
         } else {
             unreachable!("get_or_insert_with should always return a value")
-        }
-    }
-
-    /// Applies the given closure to each key-value pair in the map.
-    /// If the closure returns false for any pair, the iteration is stopped.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - A closure that takes a reference to a key and a reference to a value,
-    ///         and returns a boolean. The closure will be called for each key-value pair
-    ///         in the map. If the closure returns false for any pair, the iteration will
-    ///         be stopped.
-    pub fn range<F: FnMut(&K, &V) -> bool>(&self, mut f: F) {
-        // Unified with iterator semantics: avoid calling user closure under locks.
-        // Iterate over a table snapshot and call f after data is cloned and locks released.
-        for (k, v) in self.iter() {
-            if !f(&k, &v) {
-                break;
-            }
         }
     }
 
@@ -1850,10 +1831,15 @@ where
     }
 
     fn collect_bucket_keys(&mut self) -> bool {
-        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
-            let (k, _) = unsafe { e.unsafe_clone_key_value() };
-            Some(k)
-        });
+        let ok = collect_next_bucket(
+            &self.table,
+            &mut self.bucket_index,
+            &mut self.entries_collected,
+            |e, _meta, _j| {
+                let (k, _) = unsafe { e.unsafe_clone_key_value() };
+                Some(k)
+            },
+        );
         if ok {
             self.entries_index = 0;
         }
@@ -1913,10 +1899,15 @@ where
     }
 
     fn collect_bucket_values(&mut self) -> bool {
-        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
-            let (_, v) = unsafe { e.unsafe_clone_key_value() };
-            Some(v)
-        });
+        let ok = collect_next_bucket(
+            &self.table,
+            &mut self.bucket_index,
+            &mut self.entries_collected,
+            |e, _meta, _j| {
+                let (_, v) = unsafe { e.unsafe_clone_key_value() };
+                Some(v)
+            },
+        );
         if ok {
             self.entries_index = 0;
         }
@@ -1976,10 +1967,15 @@ where
     }
 
     fn collect_bucket_pairs(&mut self) -> bool {
-        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
-            let (k, v) = unsafe { e.unsafe_clone_key_value() };
-            Some((k, v))
-        });
+        let ok = collect_next_bucket(
+            &self.table,
+            &mut self.bucket_index,
+            &mut self.entries_collected,
+            |e, _meta, _j| {
+                let (k, v) = unsafe { e.unsafe_clone_key_value() };
+                Some((k, v))
+            },
+        );
         if ok {
             self.entries_index = 0;
         }
