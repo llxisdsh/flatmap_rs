@@ -51,17 +51,6 @@ const SPIN_BEFORE_YIELD: i32 = 128;
 // CORE TYPES AND ENUMS
 // ================================================================================================
 
-/// Operation type for Process and RangeProcess methods
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Op {
-    /// Cancel the operation, leaving the entry unchanged
-    Cancel,
-    /// Update the entry with the new value
-    Update,
-    /// Delete the entry from the map
-    Delete,
-}
-
 /// Resize hint for indicating the type of resize operation
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
