@@ -501,10 +501,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         self.retain(|_, _| false);
     }
 
-    // ============================================================================================
-    // ADVANCED API METHODS
-    // ============================================================================================
-
     /// Apply a transformation to the value for the given key and return the old value.
     ///
     /// The closure receives the current value (if any) and returns the new value to set.
