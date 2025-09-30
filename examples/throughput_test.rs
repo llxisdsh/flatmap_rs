@@ -235,7 +235,10 @@ fn test_single_thread_read() -> Vec<PerformanceResult> {
 
 // 单线程顺序数字插入测试
 fn test_single_thread_sequential_insert() -> Vec<PerformanceResult> {
-    println!("=== 单线程顺序数字插入吞吐量测试 (插入{}条数据) ===", TOTAL_OPERATIONS);
+    println!(
+        "=== 单线程顺序数字插入吞吐量测试 (插入{}条数据) ===",
+        TOTAL_OPERATIONS
+    );
     let mut results = Vec::new();
 
     // FlatMap 测试
@@ -457,13 +460,16 @@ fn test_multi_thread_insert() -> Vec<PerformanceResult> {
 // 多线程顺序数字插入测试
 fn test_multi_thread_sequential_insert() -> Vec<PerformanceResult> {
     let num_threads = num_cpus::get();
-    println!("=== 多线程顺序数字插入吞吐量测试 ({} 线程，插入{}条数据) ===", num_threads, TOTAL_OPERATIONS);
+    println!(
+        "=== 多线程顺序数字插入吞吐量测试 ({} 线程，插入{}条数据) ===",
+        num_threads, TOTAL_OPERATIONS
+    );
     let mut results = Vec::new();
     let batch_size = TOTAL_OPERATIONS / num_threads;
 
     // FlatMap 测试
     {
-        let flatmap = Arc::new(FlatMap::new());
+        let flatmap = Arc::new(FlatMap::<u64, u64>::with_capacity(TOTAL_OPERATIONS));
         let start = Instant::now();
 
         let handles: Vec<_> = (0..num_threads)
@@ -735,7 +741,10 @@ fn test_multi_thread_read() -> Vec<PerformanceResult> {
 
 // 单线程顺序数字转字符串插入测试
 fn test_single_thread_string_insert() -> Vec<PerformanceResult> {
-    println!("=== 单线程顺序数字转字符串插入吞吐量测试 (插入{}条数据) ===", TOTAL_OPERATIONS);
+    println!(
+        "=== 单线程顺序数字转字符串插入吞吐量测试 (插入{}条数据) ===",
+        TOTAL_OPERATIONS
+    );
     let mut results = Vec::new();
 
     // FlatMap 测试
@@ -798,7 +807,10 @@ fn test_single_thread_string_insert() -> Vec<PerformanceResult> {
 // 多线程顺序数字转字符串插入测试
 fn test_multi_thread_string_insert() -> Vec<PerformanceResult> {
     let num_threads = num_cpus::get();
-    println!("=== 多线程顺序数字转字符串插入吞吐量测试 ({} 线程，插入{}条数据) ===", num_threads, TOTAL_OPERATIONS);
+    println!(
+        "=== 多线程顺序数字转字符串插入吞吐量测试 ({} 线程，插入{}条数据) ===",
+        num_threads, TOTAL_OPERATIONS
+    );
     let mut results = Vec::new();
     let batch_size = TOTAL_OPERATIONS / num_threads;
 
@@ -955,10 +967,16 @@ fn main() {
     print_results("单线程读取吞吐量测试结果", &single_read_results);
 
     let single_sequential_results = test_single_thread_sequential_insert();
-    print_results("单线程顺序数字插入吞吐量测试结果", &single_sequential_results);
+    print_results(
+        "单线程顺序数字插入吞吐量测试结果",
+        &single_sequential_results,
+    );
 
     let single_string_results = test_single_thread_string_insert();
-    print_results("单线程顺序数字转字符串插入吞吐量测试结果", &single_string_results);
+    print_results(
+        "单线程顺序数字转字符串插入吞吐量测试结果",
+        &single_string_results,
+    );
 
     let multi_insert_results = test_multi_thread_insert();
     print_results("多线程插入吞吐量测试结果", &multi_insert_results);
@@ -967,10 +985,16 @@ fn main() {
     print_results("多线程读取吞吐量测试结果", &multi_read_results);
 
     let multi_sequential_results = test_multi_thread_sequential_insert();
-    print_results("多线程顺序数字插入吞吐量测试结果", &multi_sequential_results);
+    print_results(
+        "多线程顺序数字插入吞吐量测试结果",
+        &multi_sequential_results,
+    );
 
     let multi_string_results = test_multi_thread_string_insert();
-    print_results("多线程顺序数字转字符串插入吞吐量测试结果", &multi_string_results);
+    print_results(
+        "多线程顺序数字转字符串插入吞吐量测试结果",
+        &multi_string_results,
+    );
 
     // 总结
     println!("=== 性能总结 ===");
