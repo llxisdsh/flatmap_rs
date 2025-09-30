@@ -1781,11 +1781,8 @@ where
             while marked != 0 {
                 let j = first_marked_byte_index(marked);
                 let e = &entries_ref[j];
-                // Only access key/value if slot is marked as occupied in meta
-                if (meta >> (j * 8)) & SLOT_MASK != 0 {
-                    if let Some(item) = make(e, meta, j) {
-                        entries_collected.push(item);
-                    }
+                if let Some(item) = make(e, meta, j) {
+                    entries_collected.push(item);
                 }
                 marked &= marked - 1;
             }
