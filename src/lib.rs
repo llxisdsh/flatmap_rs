@@ -626,7 +626,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             }
 
             // Absent key path
-            match f(None) {
+            return match f(None) {
                 Some(new_v) => {
                     // Insert new entry
                     if let Some((empty_bucket_ptr, empty_slot)) = empty_slot_info {
@@ -648,23 +648,22 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         }
 
                         table.add_size(idx, 1);
-                        return None;
+                        None
                     } else {
                         // Append overflow bucket
-                        let new_bucket = Box::new(Bucket::single(hash64, h2, key, new_v));
-                        let new_bucket_ptr = Box::into_raw(new_bucket);
+                        let new_bucket_ptr = Bucket::alloc_single(hash64, h2, key, new_v);
                         last_bucket.next.store(new_bucket_ptr, Ordering::Release);
                         root.unlock();
                         table.add_size(idx, 1);
                         self.maybe_grow(&table);
-                        return None;
+                        None
                     }
                 }
                 None => {
                     root.unlock();
-                    return None;
+                    None
                 }
-            }
+            };
         }
     }
 
@@ -1072,9 +1071,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     let next_ptr = current_dest.next.load(Ordering::Relaxed);
                     if next_ptr.is_null() {
                         // Create new overflow bucket
-                        let new_bucket =
-                            Box::new(Bucket::single(hash64, h2, key.clone(), val.clone()));
-                        let new_ptr = Box::into_raw(new_bucket);
+                        let new_ptr = Bucket::alloc_single(hash64, h2, key.clone(), val.clone());
                         current_dest.next.store(new_ptr, Ordering::Relaxed);
 
                         break 'append_to;
@@ -1127,6 +1124,19 @@ impl<K, V> Bucket<K, V> {
         }
         b.meta.store(set_byte(0, h2, 0), Ordering::Relaxed);
         b
+    }
+
+    #[inline(always)]
+    fn alloc_single(hash: u64, h2: u8, key: K, val: V) -> *mut Bucket<K, V> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<Bucket<K, V>>();
+            let ptr = std::alloc::alloc(layout) as *mut Bucket<K, V>;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            std::ptr::write(ptr, Bucket::single(hash, h2, key, val));
+            ptr
+        }
     }
 
     #[inline(always)]
@@ -1479,7 +1489,10 @@ impl<K, V, S: BuildHasher> Drop for FlatMap<K, V, S> {
                     let mut ptr = bucket.next.load(Ordering::Relaxed);
                     while !ptr.is_null() {
                         let next_ptr = (*ptr).next.load(Ordering::Relaxed);
-                        let _ = Box::from_raw(ptr);
+                        // Deallocate overflow bucket allocated via raw allocator
+                        std::ptr::drop_in_place(ptr);
+                        let layout = std::alloc::Layout::new::<Bucket<K, V>>();
+                        std::alloc::dealloc(ptr as *mut u8, layout);
                         ptr = next_ptr;
                     }
                 }
