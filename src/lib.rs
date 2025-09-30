@@ -507,7 +507,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
     /// Returning `None` deletes the entry; returning `Some(v)` inserts or updates it.
     ///
     /// This is a full implementation that performs the update/insert/delete under
-    /// per-bucket locks and seqlock writes, independent of `process`.
+    /// per-bucket locks and seqlock writes.
     pub fn alter<F>(&self, key: K, f: F) -> Option<V>
     where
         F: FnOnce(Option<V>) -> Option<V>,
