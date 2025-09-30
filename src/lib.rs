@@ -8,6 +8,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
+use std::sync::LazyLock;
 use std::thread;
 
 use ahash::RandomState;
@@ -46,6 +47,18 @@ const RESIZE_OVER_PARTITION: usize = 4;
 
 /// pure CPU hints before any yield
 const SPIN_BEFORE_YIELD: i32 = 128;
+
+// Global cached CPU count to avoid repeated OS queries
+static CPU_COUNT: LazyLock<usize> = LazyLock::new(|| {
+    thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+});
+
+#[inline(always)]
+fn cpu_count() -> usize {
+    *CPU_COUNT
+}
 
 // ================================================================================================
 // CORE TYPES AND ENUMS
@@ -216,9 +229,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     /// hashing. This is the recommended way to set a custom hashing strategy.
     pub fn with_capacity_and_hasher(size_hint: usize, hasher: S) -> Self {
         let len = calc_table_len(size_hint);
-        let cpus = thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
+        let cpus = cpu_count();
         let size_len = calc_size_len(len, cpus);
 
         // Allocate buckets as raw pointer
@@ -1616,9 +1627,7 @@ fn calc_parallelism(
     min_buckets_per_cpu: usize,
     max_cpus: usize,
 ) -> (usize, usize) {
-    let cpus = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cpus = cpu_count();
     let over_cpus = cpus * RESIZE_OVER_PARTITION; // Use over-partition factor to reduce resize tail latency
     let max_workers = over_cpus.min(max_cpus);
     let chunks = (table_len / min_buckets_per_cpu).max(1).min(max_workers);
