@@ -1734,6 +1734,10 @@ fn delay(spins: &mut i32) {
     }
 }
 
+// ================================================================================================
+// ITERATOR IMPLEMENTATIONS
+// ================================================================================================
+
 // Unified per-bucket collector used by KeysIterator/ValuesIterator/IterIterator
 // Clones the requested item type lazily, bucket by bucket, avoiding large allocations.
 fn collect_next_bucket<K, V, T, F>(
