@@ -809,7 +809,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
     #[inline(always)]
     fn hash_pair(&self, key: &K) -> (u64, u8) {
         // Use compile-time type checking for zero-cost optimization
-        let h64 = if is_numeric_type::<K>() {
+        let mut h64 = if is_numeric_type::<K>() {
             // For numeric types, use the value directly (zero-cost like Go's intKey)
             if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u64>() {
                 unsafe { *(key as *const K as *const u64) }
@@ -833,7 +833,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                 unsafe { *(key as *const K as *const isize) as u64 }
             } else {
                 // Should not reach here if is_numeric_type is correct
-                self.hasher.hash_one(key).max(1)
+                self.hasher.hash_one(key)
             }
         } else if is_string_type::<K>() {
             // For string types, use optimized string hash
@@ -844,13 +844,13 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                 let s = unsafe { *(key as *const K as *const &str) };
                 fast_hash_string(s).0
             } else {
-                self.hasher.hash_one(key).max(1)
+                self.hasher.hash_one(key)
             }
         } else {
             // Fallback to standard hasher for other types
-            self.hasher.hash_one(key).max(1)
+            self.hasher.hash_one(key)
         };
-
+        h64 = h64.max(1);
         let h2 = self.h2(h64);
         (h64, h2)
     }
