@@ -1,60 +1,56 @@
-use flatmap_rs::{FlatMap, Op};
+use flatmap_rs::FlatMap;
 use std::sync::Arc;
 use std::thread;
 
 #[test]
-fn test_process_update_existing() {
+fn test_alter_update_existing() {
     let map = FlatMap::new();
     map.insert("key1".to_string(), 10);
 
-    let (old_val, new_val) = map.process("key1".to_string(), |old| match old {
-        Some(v) => (Op::Update, Some(v + 5)),
-        None => (Op::Cancel, None),
+    let old_val = map.alter("key1".to_string(), |old| match old {
+        Some(v) => Some(v + 5),
+        None => None,
     });
 
     assert_eq!(old_val, Some(10));
-    assert_eq!(new_val, Some(15));
     assert_eq!(map.get(&"key1".to_string()), Some(15));
 }
 
 #[test]
-fn test_process_insert_new() {
+fn test_alter_insert_new() {
     let map = FlatMap::new();
 
-    let (old_val, new_val) = map.process("key1".to_string(), |old| match old {
-        Some(_) => (Op::Cancel, None),
-        None => (Op::Update, Some(42)),
+    let old_val = map.alter("key1".to_string(), |old| match old {
+        Some(v) => Some(v), // Keep existing value
+        None => Some(42),   // Insert new value
     });
 
     assert_eq!(old_val, None);
-    assert_eq!(new_val, Some(42));
     assert_eq!(map.get(&"key1".to_string()), Some(42));
 }
 
 #[test]
-fn test_process_delete() {
+fn test_alter_delete() {
     let map = FlatMap::new();
     map.insert("key1".to_string(), 10);
 
-    let (old_val, new_val) = map.process("key1".to_string(), |old| match old {
-        Some(_v) => (Op::Delete, None),
-        None => (Op::Cancel, None),
+    let old_val = map.alter("key1".to_string(), |old| match old {
+        Some(_v) => None, // Delete
+        None => None,
     });
 
     assert_eq!(old_val, Some(10));
-    assert_eq!(new_val, None);
     assert_eq!(map.get(&"key1".to_string()), None);
 }
 
 #[test]
-fn test_process_cancel() {
+fn test_alter_cancel() {
     let map = FlatMap::new();
     map.insert("key1".to_string(), 10);
 
-    let (old_val, new_val) = map.process("key1".to_string(), |_old| (Op::Cancel, None));
+    let old_val = map.alter("key1".to_string(), |old| old); // Keep unchanged
 
     assert_eq!(old_val, Some(10));
-    assert_eq!(new_val, Some(10)); // Cancel returns the old value
     assert_eq!(map.get(&"key1".to_string()), Some(10)); // Unchanged
 }
 
@@ -92,7 +88,7 @@ fn test_range_process_delete_some() {
 }
 
 #[test]
-fn test_concurrent_process() {
+fn test_concurrent_alter() {
     let map = Arc::new(FlatMap::new());
 
     // Insert initial values
@@ -102,14 +98,14 @@ fn test_concurrent_process() {
 
     let mut handles = vec![];
 
-    // Spawn threads that use process to increment values
+    // Spawn threads that use alter to increment values
     for _ in 0..4 {
         let map_clone: Arc<FlatMap<i32, i32>> = Arc::clone(&map);
         let handle = thread::spawn(move || {
             for i in 0..100 {
-                map_clone.process(i, |old| match old {
-                    Some(v) => (Op::Update, Some(v + 1)),
-                    None => (Op::Update, Some(1)),
+                map_clone.alter(i, |old| match old {
+                    Some(v) => Some(v + 1),
+                    None => Some(1),
                 });
             }
         });

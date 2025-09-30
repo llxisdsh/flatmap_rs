@@ -6,7 +6,7 @@ use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{
-	AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
 
@@ -408,7 +408,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     where
         V: Clone,
     {
-        self.process(key, |_| (Op::Update, Some(val.clone()))).0
+        self.alter(key, |_| Some(val.clone()))
     }
 
     /// Removes the key-value pair associated with the given key from the map.
@@ -424,7 +424,7 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     where
         V: Clone,
     {
-        self.process(key, |_| (Op::Delete, None)).0
+        self.alter(key, |_| None)
     }
 
     /// Returns the value associated with the given key, or inserts a new value if the key does not exist.
@@ -441,27 +441,28 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     where
         V: Clone,
     {
-        // First try a simple get
-        if let Some(existing) = self.get(&key) {
-            return (existing, true);
-        }
-
-        // Use process method - f will only be called once now that process doesn't retry after insertion
+        // Use alter method to implement get_or_insert_with
         let mut f_option = Some(f);
-        let (old_val, new_val) = self.process(key, |old| {
-            if let Some(v) = old {
-                (Op::Cancel, Some(v.clone()))
+        let mut was_existing = false;
+        let mut result_value = None;
+
+        let _old_value = self.alter(key, |existing| {
+            if let Some(existing_val) = existing {
+                // Key exists, return the existing value
+                was_existing = true;
+                result_value = Some(existing_val.clone());
+                Some(existing_val) // Keep the existing value
             } else {
-                // Call f only once
-                let computed = f_option.take().unwrap()();
-                (Op::Update, Some(computed))
+                // Key doesn't exist, insert new value
+                let new_val = f_option.take().unwrap()();
+                result_value = Some(new_val.clone());
+                Some(new_val) // Insert the new value
             }
         });
 
-        if let Some(old) = old_val {
-            (old, true)
-        } else if let Some(new) = new_val {
-            (new, false)
+        // Return the value and whether it was existing
+        if let Some(val) = result_value {
+            (val, was_existing)
         } else {
             unreachable!("get_or_insert_with should always return a value")
         }
@@ -515,27 +516,16 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
     // ADVANCED API METHODS
     // ============================================================================================
 
-    /// Process a key with a user-defined function that can read, update, or delete the entry.
+    /// Apply a transformation to the value for the given key and return the old value.
     ///
-    /// The function receives the current value (if any) and returns an operation and optional new value.
-    /// Returns a tuple of (old_value, new_value) where old_value is the previous value (if any)
-    /// and new_value is the value that was set (if any).
-    /// Process applies a compute-style update to a specific key.
-    /// The function `f` receives the current value (if any) and returns an Op and new value.
-    /// Returns (old_value, new_value) where old_value is the previous value if any.
+    /// The closure receives the current value (if any) and returns the new value to set.
+    /// Returning `None` deletes the entry; returning `Some(v)` inserts or updates it.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - The key to process.
-    /// * `f` - A closure that takes an `Option<V>` and returns a tuple of `(Op, Option<V>)`.
-    ///
-    /// # Returns
-    ///
-    /// * `(Option<V>, Option<V>)` - A tuple containing the old value (if any) and the new value (if any).
-    pub fn process<F>(&self, key: K, mut f: F) -> (Option<V>, Option<V>)
+    /// This is a full implementation that performs the update/insert/delete under
+    /// per-bucket locks and seqlock writes, independent of `process`.
+    pub fn alter<F>(&self, key: K, f: F) -> Option<V>
     where
-        F: FnMut(Option<&V>) -> (Op, Option<V>),
-        V: Clone,
+        F: FnOnce(Option<V>) -> Option<V>,
     {
         let (hash64, h2) = self.hash_pair(&key);
         let h2w = broadcast(h2);
@@ -546,27 +536,26 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
 
             root.lock();
 
-            // Check if resize is in progress before proceeding (like Go version)
+            // Handle ongoing resize if a new table is ready
             if self.resize_state.started.load(Ordering::Acquire)
                 && self.resize_state.is_new_table_ready()
             {
                 root.unlock();
                 self.help_copy_and_wait();
-                continue; // Retry with new table
+                continue; // Retry with possibly swapped table
             }
 
-            // Check if table was swapped during lock acquisition
+            // If table swapped during lock acquisition, retry
             if unsafe { *table.seq.as_ptr() } != self.table.seq.load(Ordering::Relaxed) {
                 root.unlock();
-                continue; // Retry with new table
+                continue;
             }
 
-            // Search for existing key and track empty slots
+            // Search for key and track first empty slot and tail bucket
             let mut found_info: Option<(*mut Bucket<K, V>, usize)> = None;
             let mut empty_slot_info: Option<(*const Bucket<K, V>, usize)> = None;
 
             let mut b = root;
-            // Track the last bucket to avoid a second traversal when appending
             let mut last_bucket = b;
             'search_loop: loop {
                 let entries = b.get_entries();
@@ -585,7 +574,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     marked &= marked - 1;
                 }
 
-                // Track empty slots for potential insertion
                 if empty_slot_info.is_none() {
                     let empty = (!meta) & META_MASK;
                     if empty != 0 {
@@ -593,7 +581,6 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                     }
                 }
 
-                // Update last bucket each iteration; if next is null, b is the tail
                 let next_ptr = b.next.load(Ordering::Relaxed);
                 if !next_ptr.is_null() {
                     last_bucket = unsafe { &*next_ptr };
@@ -603,49 +590,34 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 }
             }
 
-            return if let Some((bucket_ptr, slot)) = found_info {
-                // Key found - process existing entry
+            // Existing key path
+            if let Some((bucket_ptr, slot)) = found_info {
                 let bucket = unsafe { &*bucket_ptr };
                 let entries = bucket.get_entries_mut();
                 let entry = &mut entries[slot];
                 let old_ref = entry.get_value();
-                let (op, new_val) = f(Some(old_ref));
+                let old_clone = old_ref.clone();
 
-                match op {
-                    Op::Cancel => {
+                match f(Some(old_clone.clone())) {
+                    Some(new_v) => {
+                        // Update value under seqlock
+                        let seq = bucket.seq.load(Ordering::Relaxed);
+                        bucket.seq.store(seq + 1, Ordering::Relaxed);
+                        entry.val = MaybeUninit::new(new_v);
+                        bucket.seq.store(seq + 2, Ordering::Release);
                         root.unlock();
-                        let old_clone = old_ref.clone();
-                        (Some(old_clone.clone()), Some(old_clone))
+                        return Some(old_clone);
                     }
-                    Op::Update => {
-                        if let Some(new_v) = new_val {
-                            // Use seqlock to protect the write operation (like Go)
-                            let seq = bucket.seq.load(Ordering::Relaxed);
-                            bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                                                          // Clone old value before mutation to end immutable borrow
-                            let old_clone = old_ref.clone();
-                            entry.val = MaybeUninit::new(new_v.clone());
-                            bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
-                            root.unlock();
-                            (Some(old_clone), Some(new_v))
-                        } else {
-                            root.unlock();
-                            (Some(old_ref.clone()), None)
-                        }
-                    }
-                    Op::Delete => {
-                        // Use seqlock to protect the delete operation (like Go version)
-                        // Precompute new meta and minimize odd window
+                    None => {
+                        // Delete entry under seqlock
                         let meta = bucket.meta.load(Ordering::Relaxed);
                         let new_meta = set_byte(meta, EMPTY_SLOT, slot);
                         let seq = bucket.seq.load(Ordering::Relaxed);
-                        bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
+                        bucket.seq.store(seq + 1, Ordering::Relaxed);
                         bucket.meta.store(new_meta, Ordering::Relaxed);
-                        bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
+                        bucket.seq.store(seq + 2, Ordering::Release);
 
-                        // After publishing even seq, clear entry fields before releasing root lock
-                        // Clone old value before mutation to end immutable borrow
-                        let old_clone = old_ref.clone();
+                        // Clear entry fields and drop K,V
                         entry.clear();
                         unsafe {
                             std::ptr::drop_in_place(entry.key.as_mut_ptr());
@@ -658,76 +630,52 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                             root.unlock();
                         }
 
-                        // Update counter
                         table.add_size(idx, -1);
-                        // self.maybe_resize_after_remove(table);
-                        (Some(old_clone), None)
+                        return Some(old_clone);
                     }
                 }
-            } else {
-                // Key not found - process new entry
-                let (op, new_val) = f(None);
-                match op {
-                    Op::Cancel | Op::Delete => {
-                        root.unlock();
-                        (None, None)
-                    }
-                    Op::Update => {
-                        if let Some(new_v) = new_val {
-                            // Insert new entry directly under lock (like Go version)
-                            if let Some((empty_bucket_ptr, empty_slot)) = empty_slot_info {
-                                // Insert into existing bucket with empty slot
-                                let empty_bucket = unsafe { &*empty_bucket_ptr };
-                                let entries = empty_bucket.get_entries_mut();
+            }
 
-                                // Prefill entry data before odd to shorten odd window (like Go)
-                                entries[empty_slot].init_entry(hash64, key, new_v.clone());
-                                let meta = empty_bucket.meta.load(Ordering::Relaxed);
-                                let new_meta = set_byte(meta, h2, empty_slot);
+            // Absent key path
+            match f(None) {
+                Some(new_v) => {
+                    // Insert new entry
+                    if let Some((empty_bucket_ptr, empty_slot)) = empty_slot_info {
+                        let empty_bucket = unsafe { &*empty_bucket_ptr };
+                        let entries = empty_bucket.get_entries_mut();
+                        entries[empty_slot].init_entry(hash64, key, new_v);
+                        let meta = empty_bucket.meta.load(Ordering::Relaxed);
+                        let new_meta = set_byte(meta, h2, empty_slot);
 
-                                // Use seqlock to protect the meta update (like Go)
-                                let seq = empty_bucket.seq.load(Ordering::Relaxed);
-                                empty_bucket.seq.store(seq + 1, Ordering::Relaxed); // Start write (make odd)
-                                                                                    // Publish meta while still holding the root lock to ensure
-                                                                                    // no other writer starts while this bucket is in odd state
-                                empty_bucket.meta.store(new_meta, Ordering::Relaxed);
-                                // Complete seqlock write (make it even) before releasing root lock
-                                empty_bucket.seq.store(seq + 2, Ordering::Release); // End write (make even)
+                        let seq = empty_bucket.seq.load(Ordering::Relaxed);
+                        empty_bucket.seq.store(seq + 1, Ordering::Relaxed);
+                        empty_bucket.meta.store(new_meta, Ordering::Relaxed);
+                        empty_bucket.seq.store(seq + 2, Ordering::Release);
 
-                                if std::ptr::eq(empty_bucket, root) {
-                                    root.unlock_with_meta(new_meta);
-                                } else {
-                                    root.unlock();
-                                }
-
-                                // Update counter
-                                table.add_size(idx, 1);
-
-                                (None, Some(new_v))
-                            } else {
-                                // Need to create new bucket - use recorded tail bucket
-                                let new_bucket =
-                                    Box::new(Bucket::single(hash64, h2, key, new_v.clone()));
-                                let new_bucket_ptr = Box::into_raw(new_bucket);
-
-                                // Link new bucket
-                                last_bucket.next.store(new_bucket_ptr, Ordering::Release);
-                                // Unlock root after linking overflow bucket
-                                root.unlock();
-
-                                // Update counter
-                                table.add_size(idx, 1);
-
-                                self.maybe_grow(&table);
-                                (None, Some(new_v))
-                            }
+                        if std::ptr::eq(empty_bucket, root) {
+                            root.unlock_with_meta(new_meta);
                         } else {
                             root.unlock();
-                            (None, None)
                         }
+
+                        table.add_size(idx, 1);
+                        return None;
+                    } else {
+                        // Append overflow bucket
+                        let new_bucket = Box::new(Bucket::single(hash64, h2, key, new_v));
+                        let new_bucket_ptr = Box::into_raw(new_bucket);
+                        last_bucket.next.store(new_bucket_ptr, Ordering::Release);
+                        root.unlock();
+                        table.add_size(idx, 1);
+                        self.maybe_grow(&table);
+                        return None;
                     }
                 }
-            };
+                None => {
+                    root.unlock();
+                    return None;
+                }
+            }
         }
     }
 
