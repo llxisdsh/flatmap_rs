@@ -14,7 +14,7 @@ use std::thread;
 use ahash::RandomState;
 
 // ================================================================================================
-// CONSTANTS
+// CONSTANTS AND GLOBAL VARIABLES
 // ================================================================================================
 
 /// Number of entries per bucket (op byte = highest, keep 7 data bytes like Go)
@@ -60,31 +60,6 @@ fn cpu_count() -> usize {
     *CPU_COUNT
 }
 
-// ================================================================================================
-// TYPE-SPECIALIZED HASHING SYSTEM
-// ================================================================================================
-
-/// Fast string hash similar to Go's hashString
-#[inline(always)]
-fn fast_hash_string(s: &str) -> (u64, bool) {
-    let mut hash = 0u64;
-    for byte in s.as_bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
-    }
-    (hash, false) // Use shift distribution for strings
-}
-
-// ================================================================================================
-// CORE TYPES AND ENUMS
-// ================================================================================================
-
-/// Resize hint for indicating the type of resize operation
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum ResizeHint {
-    Grow,
-    Shrink,
-}
 // ================================================================================================
 // INTERNAL DATA STRUCTURES
 // ================================================================================================
@@ -146,7 +121,6 @@ impl<K, V> Clone for Table<K, V> {
 /// Parallel resize state structure (corresponds to Go's flatResizeState)
 struct ResizeState<K, V> {
     started: AtomicBool,                        // Whether resize has started
-    hint: UnsafeCell<ResizeHint>,               // Resize operation type (protected by started)
     chunks: AtomicI32,                          // Set by finalizeResize
     new_table: UnsafeCell<Option<Table<K, V>>>, // Protected by started flag
     process: AtomicI32,                         // Atomic counter for work distribution
@@ -157,7 +131,6 @@ impl<K, V> ResizeState<K, V> {
     pub fn new() -> Self {
         Self {
             started: AtomicBool::new(false),
-            hint: UnsafeCell::new(ResizeHint::Grow),
             chunks: AtomicI32::new(0),
             new_table: UnsafeCell::new(None),
             process: AtomicI32::new(0),
@@ -226,31 +199,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone> FlatMap<K, V, RandomState> {
     pub fn with_capacity(size_hint: usize) -> Self {
         Self::with_capacity_and_hasher(size_hint, RandomState::new())
     }
-}
-
-// ================================================================================================
-// SPECIALIZED IMPLEMENTATIONS FOR NUMERIC TYPES
-// ================================================================================================
-
-/// Helper functions to check if a type is numeric at compile time
-#[inline(always)]
-fn is_numeric_type<T: 'static>() -> bool {
-    std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<usize>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i8>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i16>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i32>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i64>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<isize>()
-}
-
-#[inline(always)]
-fn is_string_type<T: 'static>() -> bool {
-    std::any::TypeId::of::<T>() == std::any::TypeId::of::<String>()
-        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<&str>()
 }
 
 impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
@@ -807,79 +755,6 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
     // ============================================================================================
 
     #[inline(always)]
-    fn hash_pair(&self, key: &K) -> (u64, u8) {
-        // Use compile-time type checking for zero-cost optimization
-        let mut h64 = if is_numeric_type::<K>() {
-            // For numeric types, use the value directly (zero-cost like Go's intKey)
-            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u64>() {
-                unsafe { *(key as *const K as *const u64) }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u32>() {
-                unsafe { *(key as *const K as *const u32) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u16>() {
-                unsafe { *(key as *const K as *const u16) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u8>() {
-                unsafe { *(key as *const K as *const u8) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<usize>() {
-                unsafe { *(key as *const K as *const usize) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i64>() {
-                unsafe { *(key as *const K as *const i64) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i32>() {
-                unsafe { *(key as *const K as *const i32) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i16>() {
-                unsafe { *(key as *const K as *const i16) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i8>() {
-                unsafe { *(key as *const K as *const i8) as u64 }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<isize>() {
-                unsafe { *(key as *const K as *const isize) as u64 }
-            } else {
-                // Should not reach here if is_numeric_type is correct
-                self.hasher.hash_one(key)
-            }
-        } else if is_string_type::<K>() {
-            // For string types, use optimized string hash
-            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<String>() {
-                let s = unsafe { &*(key as *const K as *const String) };
-                if s.len() <= 12 {
-                    fast_hash_string(s).0
-                } else {
-                    self.hasher.hash_one(key)
-                }
-            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<&str>() {
-                let s = unsafe { *(key as *const K as *const &str) };
-                if s.len() <= 12 {
-                    fast_hash_string(s).0
-                } else {
-                    self.hasher.hash_one(key)
-                }
-            } else {
-                self.hasher.hash_one(key)
-            }
-        } else {
-            // Fallback to standard hasher for other types
-            self.hasher.hash_one(key)
-        };
-        h64 = h64.max(1);
-        let h2 = self.h2(h64);
-        (h64, h2)
-    }
-
-    #[inline(always)]
-    fn h1_mask(&self, hash64: u64, mask: usize) -> usize {
-        if is_numeric_type::<K>() {
-            // Linear distribution for integers (like Go's intKey=true)
-            ((hash64 as usize) / ENTRIES_PER_BUCKET) & mask
-        } else {
-            // Shift distribution for strings and other types (like Go's intKey=false)
-            ((hash64 >> 7) as usize) & mask
-        }
-    }
-
-    #[inline(always)]
-    fn h2(&self, hash64: u64) -> u8 {
-        (hash64 as u8) | SLOT_MASK // Use top 7 bits, avoid 0x80 which is used for locking
-    }
-
-    #[inline(always)]
     fn maybe_grow(&self, table: &Table<K, V>) {
         if self.resize_state.started.load(Ordering::Relaxed) {
             return;
@@ -888,25 +763,25 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         let total = table.sum_size();
         let threshold = (cap as f64 * LOAD_FACTOR) as usize;
         if total > threshold {
-            self.try_resize(ResizeHint::Grow);
+            self.try_resize(/*ResizeHint::Grow*/);
         }
     }
 
-    fn try_resize(&self, hint: ResizeHint) {
+    fn try_resize(&self /*, hint: ResizeHint*/) {
         // Check if resize is already in progress using the started flag
         // if self.resize_state.started.load(Ordering::Relaxed) {
         //     return;
         // }
 
         // Try to start a new resize
-        let old_table = self.table.seq_load();
-        let old_len = old_table.mask() + 1;
+        // let old_table = self.table.seq_load();
+        // let old_len = old_table.mask() + 1;
 
-        if hint == ResizeHint::Shrink {
-            if old_len <= MIN_TABLE_LEN {
-                return; // No shrink needed
-            }
-        }
+        // if hint == ResizeHint::Shrink {
+        //     if old_len <= MIN_TABLE_LEN {
+        //         return; // No shrink needed
+        //     }
+        // }
 
         // Try to acquire the resize lock by setting started to true
         match self.resize_state.started.compare_exchange(
@@ -917,9 +792,9 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         ) {
             Ok(_) => {
                 // Successfully started resize, set the hint
-                unsafe {
-                    *self.resize_state.hint.get() = hint;
-                }
+                // unsafe {
+                //     *self.resize_state.hint.get() = hint;
+                // }
 
                 // Reset resize state fields
                 unsafe {
@@ -946,18 +821,19 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         let old_table = self.table.seq_load();
         let old_len = old_table.mask() + 1;
 
+        let new_len = old_len << 1;
         // Calculate new table length based on resize hint
-        let new_len = match unsafe { &*state.hint.get() } {
-            ResizeHint::Grow => old_len * 2,
-            ResizeHint::Shrink => {
-                if old_len <= MIN_TABLE_LEN {
-                    // Should not happen, but handle gracefully
-                    state.started.store(false, Ordering::Release);
-                    return;
-                }
-                old_len / 2
-            }
-        };
+        // let new_len = match unsafe { &*state.hint.get() } {
+        //     ResizeHint::Grow => old_len * 2,
+        //     ResizeHint::Shrink => {
+        //         if old_len <= MIN_TABLE_LEN {
+        //             // Should not happen, but handle gracefully
+        //             state.started.store(false, Ordering::Release);
+        //             return;
+        //         }
+        //         old_len / 2
+        //     }
+        // };
 
         // Calculate parallelism for the copy operation
         let (_, chunks) = calc_parallelism(old_len, MIN_BUCKETS_PER_CPU, num_cpus::get());
@@ -1201,6 +1077,79 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
 
         bucket.unlock();
         copied
+    }
+
+    #[inline(always)]
+    fn hash_pair(&self, key: &K) -> (u64, u8) {
+        // Use compile-time type checking for zero-cost optimization
+        let mut h64 = if is_numeric_type::<K>() {
+            // For numeric types, use the value directly (zero-cost like Go's intKey)
+            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u64>() {
+                unsafe { *(key as *const K as *const u64) }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u32>() {
+                unsafe { *(key as *const K as *const u32) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u16>() {
+                unsafe { *(key as *const K as *const u16) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<u8>() {
+                unsafe { *(key as *const K as *const u8) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<usize>() {
+                unsafe { *(key as *const K as *const usize) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i64>() {
+                unsafe { *(key as *const K as *const i64) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i32>() {
+                unsafe { *(key as *const K as *const i32) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i16>() {
+                unsafe { *(key as *const K as *const i16) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<i8>() {
+                unsafe { *(key as *const K as *const i8) as u64 }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<isize>() {
+                unsafe { *(key as *const K as *const isize) as u64 }
+            } else {
+                // Should not reach here if is_numeric_type is correct
+                self.hasher.hash_one(key)
+            }
+        } else if is_string_type::<K>() {
+            // For string types, use optimized string hash
+            if std::any::TypeId::of::<K>() == std::any::TypeId::of::<String>() {
+                let s = unsafe { &*(key as *const K as *const String) };
+                if s.len() <= 12 {
+                    fast_hash_string(s).0
+                } else {
+                    self.hasher.hash_one(key)
+                }
+            } else if std::any::TypeId::of::<K>() == std::any::TypeId::of::<&str>() {
+                let s = unsafe { *(key as *const K as *const &str) };
+                if s.len() <= 12 {
+                    fast_hash_string(s).0
+                } else {
+                    self.hasher.hash_one(key)
+                }
+            } else {
+                self.hasher.hash_one(key)
+            }
+        } else {
+            // Fallback to standard hasher for other types
+            self.hasher.hash_one(key)
+        };
+        h64 = h64.max(1);
+        let h2 = self.h2(h64);
+        (h64, h2)
+    }
+
+    #[inline(always)]
+    fn h1_mask(&self, hash64: u64, mask: usize) -> usize {
+        if is_numeric_type::<K>() {
+            // Linear distribution for integers (like Go's intKey=true)
+            ((hash64 as usize) / ENTRIES_PER_BUCKET) & mask
+        } else {
+            // Shift distribution for strings and other types (like Go's intKey=false)
+            ((hash64 >> 7) as usize) & mask
+        }
+    }
+
+    #[inline(always)]
+    fn h2(&self, hash64: u64) -> u8 {
+        (hash64 as u8) | SLOT_MASK // Use top 7 bits, avoid 0x80 which is used for locking
     }
 }
 
@@ -1694,6 +1643,37 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Default> Extend<
 // ================================================================================================
 // UTILITY FUNCTIONS
 // ================================================================================================
+
+/// Helper functions to check if a type is numeric at compile time
+#[inline(always)]
+fn is_numeric_type<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u16>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u32>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<u64>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<usize>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i8>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i16>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i32>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<i64>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<isize>()
+}
+
+#[inline(always)]
+fn is_string_type<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<String>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<&str>()
+}
+
+/// Fast string hash similar to Go's hashString
+#[inline(always)]
+fn fast_hash_string(s: &str) -> (u64, bool) {
+    let mut hash = 0u64;
+    for byte in s.as_bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
+    }
+    (hash, false) // Use shift distribution for strings
+}
 
 /// Calculate the next power of 2 greater than or equal to n
 fn next_pow2(mut n: usize) -> usize {
