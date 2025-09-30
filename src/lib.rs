@@ -8,6 +8,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::thread;
+use std::marker::PhantomData;
 
 use ahash::RandomState;
 
@@ -1794,8 +1795,8 @@ fn delay(spins: &mut i32) {
 
 // Unified per-bucket collector used by KeysIterator/ValuesIterator/IterIterator
 // Clones the requested item type lazily, bucket by bucket, avoiding large allocations.
-fn collect_next_bucket<K, V, S, T, F>(
-    map: &FlatMap<K, V, S>,
+fn collect_next_bucket<K, V, T, F>(
+    table: &Table<K, V>,
     bucket_index: &mut usize,
     entries_collected: &mut Vec<T>,
     mut make: F,
@@ -1803,11 +1804,8 @@ fn collect_next_bucket<K, V, S, T, F>(
 where
     K: Clone,
     V: Clone,
-    S: BuildHasher,
     F: FnMut(&Entry<K, V>, u64, usize) -> Option<T>,
 {
-    let table = map.table.seq_load();
-
     while *bucket_index <= table.mask() {
         let root = table.get_bucket(*bucket_index);
         root.lock();
@@ -1849,10 +1847,11 @@ pub struct KeysIterator<K, V, S = RandomState>
 where
     S: BuildHasher,
 {
-    map: *const FlatMap<K, V, S>,
+    table: Table<K, V>,
     bucket_index: usize,
     entries_collected: Vec<K>,
     entries_index: usize,
+    _phantom: PhantomData<S>,
 }
 
 impl<K, V, S> KeysIterator<K, V, S>
@@ -1863,16 +1862,16 @@ where
 {
     fn new(map: &FlatMap<K, V, S>) -> Self {
         Self {
-            map: map as *const FlatMap<K, V, S>,
+            table: map.table.seq_load(),
             bucket_index: 0,
             entries_collected: Vec::new(),
             entries_index: 0,
+            _phantom: PhantomData,
         }
     }
 
     fn collect_bucket_keys(&mut self) -> bool {
-        let map = unsafe { &*self.map };
-        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
             let (k, _) = unsafe { e.unsafe_clone_key_value() };
             Some(k)
         });
@@ -1911,10 +1910,11 @@ pub struct ValuesIterator<K, V, S = RandomState>
 where
     S: BuildHasher,
 {
-    map: *const FlatMap<K, V, S>,
+    table: Table<K, V>,
     bucket_index: usize,
     entries_collected: Vec<V>,
     entries_index: usize,
+    _phantom: PhantomData<S>,
 }
 
 impl<K, V, S> ValuesIterator<K, V, S>
@@ -1925,16 +1925,16 @@ where
 {
     fn new(map: &FlatMap<K, V, S>) -> Self {
         Self {
-            map: map as *const FlatMap<K, V, S>,
+            table: map.table.seq_load(),
             bucket_index: 0,
             entries_collected: Vec::new(),
             entries_index: 0,
+            _phantom: PhantomData,
         }
     }
 
     fn collect_bucket_values(&mut self) -> bool {
-        let map = unsafe { &*self.map };
-        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
             let (_, v) = unsafe { e.unsafe_clone_key_value() };
             Some(v)
         });
@@ -1973,10 +1973,11 @@ pub struct IterIterator<K, V, S = RandomState>
 where
     S: BuildHasher,
 {
-    map: *const FlatMap<K, V, S>,
+    table: Table<K, V>,
     bucket_index: usize,
     entries_collected: Vec<(K, V)>,
     entries_index: usize,
+    _phantom: PhantomData<S>,
 }
 
 impl<K, V, S> IterIterator<K, V, S>
@@ -1987,16 +1988,16 @@ where
 {
     fn new(map: &FlatMap<K, V, S>) -> Self {
         Self {
-            map: map as *const FlatMap<K, V, S>,
+            table: map.table.seq_load(),
             bucket_index: 0,
             entries_collected: Vec::new(),
             entries_index: 0,
+            _phantom: PhantomData,
         }
     }
 
     fn collect_bucket_pairs(&mut self) -> bool {
-        let map = unsafe { &*self.map };
-        let ok = collect_next_bucket(map, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
+        let ok = collect_next_bucket(&self.table, &mut self.bucket_index, &mut self.entries_collected, |e, _meta, _j| {
             let (k, v) = unsafe { e.unsafe_clone_key_value() };
             Some((k, v))
         });
