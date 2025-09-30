@@ -20,32 +20,26 @@ FlatMap is now a **stable, production-ready** concurrent hash map implementation
 - **Concurrent Safe**: Thread-safe operations for both reads and writes
 - **Zero-Copy Reads**: Read operations don't require data copying in most cases
 
-### Core Components
-
-- **Atomic Operations**: Leverages Rust's atomic primitives for thread safety
-- **Sequence Locks**: Implements seqlock mechanism for consistent reads during concurrent writes
-- **Custom Hashing**: Supports pluggable hash functions via `BuildHasher` trait
-- **Dynamic Resizing**: Automatic capacity expansion when load factor exceeds threshold
-
 ## 📊 Performance Benchmarks
 
 Comprehensive benchmarks comparing FlatMap with `std::collections::HashMap` and `DashMap`:
 
 ### Latest Throughput Test Results
 
-| Test Scenario | FlatMap | HashMap+Mutex | DashMap | FlatMap Advantage |
-|---------------|---------|---------------|---------|-------------------|
-| **Multi-Thread Get** | 1,334M ops/sec | - | 353M ops/sec | **3.8x faster** |
-| **Multi-Thread Insert** (64 threads) | 98M ops/sec | - | 45M ops/sec | **2.2x faster** |
-| **Multi-Thread String Insert** (64 threads) | 20.8M ops/sec | 0.8M ops/sec | 12.8M ops/sec | **25x vs Mutex, 1.6x vs DashMap** |
 
+| Test Scenario                               | FlatMap        | DashMap       | FlatMap Advantage |
+|---------------------------------------------|----------------|---------------|-------------------|
+| **Multi-Thread Get**                        | 1,334M ops/sec | 353M ops/sec  | **3.8x faster**   |
+| **Multi-Thread Insert** (64 threads)        | 98M ops/sec    | 45M ops/sec   | **2.2x faster**   |
+| **Multi-Thread String Insert** (64 threads) | 20.8M ops/sec  | 12.8M ops/sec | **1.6x faster**   |
+(10/1/2025)
 ### Criterion Benchmark Results
 
-| Operation Type | FlatMap | HashMap | DashMap | Winner |
-|----------------|---------|---------|---------|---------|
-| **Insert** (10k operations) | **680µs** | 1,154µs | 699µs | **FlatMap** |
-| **Read** (10k operations) | **113µs** | 95µs | 152µs | **FlatMap** |
-
+| Operation Type              | FlatMap   | HashMap | DashMap | Winner      |
+|-----------------------------|-----------|---------|---------|-------------|
+| **Insert** (10k operations) | **680µs** | 1,154µs | 699µs   | **FlatMap** |
+| **Read** (10k operations)   | **113µs** | 95µs    | 152µs   | **FlatMap** |
+(10/1/2025)
 ### Performance Summary
 
 - 🚀 **Exceptional concurrent write performance** - Up to 25x faster than Mutex-protected HashMap
@@ -197,81 +191,11 @@ fn main() {
 }
 ```
 
-## 🎯 Use Cases
-
-FlatMap is particularly well-suited for:
-
-- **Read-Heavy Applications**: Caches, configuration stores, lookup tables
-- **Concurrent Web Services**: Session stores, request routing tables
-- **Real-Time Systems**: Where consistent read performance is critical
-- **Mixed Workloads**: Applications with more reads than writes (typical in most systems)
-
 ## 🔧 Features
 
 - `default`: Enables `ahash` and `std` features
 - `ahash`: Use AHash as the default hasher (recommended for performance)
 - `std`: Enable standard library features
-
-## 🧪 Testing and Benchmarks
-
-### Quick Performance Testing
-
-Use the provided batch script to run comprehensive throughput tests:
-
-```bash
-# Windows
-.\run_throughput_test.bat
-
-# Or run individual tests manually:
-cargo run --release --example throughput_test
-cargo bench --bench throughput_comparison
-cargo bench --bench multi_thread_throughput
-```
-
-### Available Benchmark Suites
-
-The `benches/` directory contains three comprehensive benchmark suites:
-
-#### 1. `throughput_comparison.rs` - Single vs Multi-threaded Comparison
-- **Single-threaded**: Insert/read operations (10k items)
-- **Multi-threaded**: Concurrent operations across multiple CPU cores
-- **Compares**: FlatMap vs HashMap vs DashMap
-
-#### 2. `multi_thread_throughput.rs` - Concurrent Performance Analysis  
-- **Multi-threaded insert**: Parallel insertion across threads
-- **Mixed workloads**: Read/write operations with different ratios
-- **Stress testing**: High-concurrency scenarios
-
-#### 3. `flatmap.rs` - Core Operations Benchmark
-- **Mixed operations**: Insert + Get + Remove cycles (50k operations each)
-- **Performance baseline**: Direct comparison with standard collections
-- **Memory efficiency**: Allocation and access pattern analysis
-
-### Running Specific Benchmarks
-
-```bash
-# Run single benchmark suite
-cargo bench --bench throughput_comparison
-
-# Run with specific test filter
-cargo bench --bench flatmap -- insert_get_remove
-
-# Generate detailed HTML reports
-cargo bench
-# Reports available in: target/criterion/
-
-# Run throughput examples for real-world performance data
-cargo run --release --example throughput_test
-cargo run --release --example process_demo
-```
-
-### Performance Testing Results
-
-The benchmarks demonstrate FlatMap's strengths:
-- **Concurrent writes**: 2-25x faster than alternatives
-- **Read performance**: Competitive with HashMap, faster than DashMap  
-- **Memory efficiency**: Flat layout reduces cache misses
-- **Scalability**: Performance scales well with thread count
 
 ## 🤝 Contributing
 
