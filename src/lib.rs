@@ -95,10 +95,10 @@ impl<K, V> Default for Entry<K, V> {
 /// Bucket containing entries and metadata for concurrent access
 #[repr(align(8))]
 struct Bucket<K, V> {
-    seq: AtomicU64,
-    meta: AtomicU64,
-    next: AtomicPtr<Bucket<K, V>>, // was: UnsafeCell<Option<Box<Bucket<K, V>>>>
-    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>,
+    meta: AtomicU64, // Moved first - accessed most frequently in hot paths
+    seq: AtomicU64,  // Seqlock - accessed together with meta
+    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>, // Large field, accessed after meta check
+    next: AtomicPtr<Bucket<K, V>>, // Least frequently accessed - only for overflow
 }
 
 // SAFETY: We provide per-bucket seqlock (seq) and atomic meta updates, and never move buckets after creation.
@@ -317,9 +317,10 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
             let mut spins = 0;
 
             'retry: loop {
-                let s1 = b.seq.load(Ordering::Acquire);
+                // Use relaxed ordering for initial read - we'll validate with acquire later
+                let s1 = b.seq.load(Ordering::Relaxed);
                 if (s1 & 1) != 0 {
-                    // writer in progress
+                    // writer in progress - unlikely in read-heavy workloads
                     if try_spin(&mut spins) {
                         continue 'retry;
                     }
@@ -343,22 +344,23 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                         continue;
                     }
 
-                    // For potential matches, copy key and val before seqlock check
-                    let (entry_key, entry_val) = unsafe { e.unsafe_clone_key_value() };
+                    // Delay cloning until we know hash matches - first check key equality with unsafe access
+                    let entry_key_ref = unsafe { e.key.assume_init_ref() };
+                    if entry_key_ref != key {
+                        marked &= marked - 1;
+                        continue;
+                    }
+                    // Clone only the value since we already confirmed key match
+                    let entry_val = unsafe { e.val.assume_init_ref().clone() };
 
-                    // Check seqlock immediately after copying (like Go version)
+                    // Now we know it's a match - do acquire fence and clone value
                     let s2 = b.seq.load(Ordering::Acquire);
                     if s1 != s2 {
-                        // Seqlock mismatch, retry now
+                        // Seqlock mismatch, retry now - unlikely in low-contention scenarios
                         continue 'retry;
                     }
 
-                    // Validate the copied entry
-                    if entry_key == *key {
-                        return Some(entry_val);
-                    }
-
-                    marked &= marked - 1;
+                    return Some(entry_val);
                 }
 
                 // Successfully processed this bucket, move to next
@@ -1045,7 +1047,9 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher> FlatMap<K, V, S> {
                 // Check if slot is marked as occupied and entry is occupied
                 let (key, val) = entry.clone_key_value();
                 let hash64 = entry.hash;
-                let h2 = self.h2(hash64);
+                // Extract h2 directly from meta instead of recalculating
+                let h2 = ((meta >> (j * 8)) & 0xFF) as u8;
+                // let h2 = self.h2(hash64);
 
                 // For shrink operations, lock destination bucket during insertion
                 let idx = self.h1_mask(hash64, new_table.mask());
