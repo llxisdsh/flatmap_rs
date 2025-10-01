@@ -383,7 +383,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
     where
         V: Clone,
     {
-        self.alter(key, |_| Some(val.clone()))
+        self.alter(key, |_| Some(val))
     }
 
     /// Removes the key-value pair associated with the given key from the map.
@@ -419,27 +419,28 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
         // Use alter method to implement get_or_insert_with
         let mut f_option = Some(f);
         let mut was_existing = false;
-        let mut result_value = None;
+        let mut new_value = None;
 
-        let _old_value = self.alter(key, |existing| {
+        let old_value = self.alter(key, |existing| {
             if let Some(existing_val) = existing {
                 // Key exists, return the existing value
                 was_existing = true;
-                result_value = Some(existing_val.clone());
                 Some(existing_val) // Keep the existing value
             } else {
                 // Key doesn't exist, insert new value
                 let new_val = f_option.take().unwrap()();
-                result_value = Some(new_val.clone());
+                new_value = Some(new_val.clone());
                 Some(new_val) // Insert the new value
             }
         });
 
         // Return the value and whether it was existing
-        if let Some(val) = result_value {
-            (val, was_existing)
+        if was_existing {
+            // If key existed, old_value contains the existing value
+            (old_value.unwrap(), true)
         } else {
-            unreachable!("get_or_insert_with should always return a value")
+            // If key didn't exist, return the new value we created
+            (new_value.unwrap(), false)
         }
     }
 
@@ -566,8 +567,7 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
                 let bucket = unsafe { &*bucket_ptr };
                 let entries = bucket.get_entries_mut();
                 let entry = &mut entries[slot];
-                let old_ref = entry.get_value();
-                let old_clone = old_ref.clone();
+                let old_clone = entry.get_value().clone();
 
                 return match f(Some(old_clone.clone())) {
                     Some(new_v) => {
