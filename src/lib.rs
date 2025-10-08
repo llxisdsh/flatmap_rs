@@ -43,7 +43,7 @@ const OP_LOCK_MASK: u64 = 0x8000_0000_0000_0000;
 const MIN_BUCKETS_PER_CPU: usize = 16;
 
 /// Over-partition factor for resize to reduce tail latency
-const RESIZE_OVER_PARTITION: usize = 4;
+const RESIZE_OVER_PARTITION: usize = 8;
 
 /// pure CPU hints before any yield
 const SPIN_BEFORE_YIELD: i32 = 128;
@@ -84,10 +84,10 @@ impl<K, V> Default for Entry<K, V> {
 /// Bucket containing entries and metadata for concurrent access
 #[repr(align(8))]
 struct Bucket<K, V> {
-    meta: AtomicU64, // Moved first - accessed most frequently in hot paths
-    seq: AtomicU64,  // Seqlock - accessed together with meta
-    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>, // Large field, accessed after meta check
+    meta: AtomicU64,               // Moved first - accessed most frequently in hot paths
+    seq: AtomicU64,                // Seqlock - accessed together with meta
     next: AtomicPtr<Bucket<K, V>>, // Least frequently accessed - only for overflow
+    entries: UnsafeCell<[Entry<K, V>; ENTRIES_PER_BUCKET]>, // Large field, accessed after meta check
 }
 
 // SAFETY: We provide per-bucket seqlock (seq) and atomic meta updates, and never move buckets after creation.
@@ -1087,11 +1087,193 @@ impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher> FlatMap<K, V, S> 
 }
 
 // ================================================================================================
+// SHARED FLATMAP (SHARDED)
+// ================================================================================================
+
+/// Shared (sharded) FlatMap: fixed-size array of FlatMap shards selected by hashing the key.
+/// The shard count is specified via a const generic parameter `N`.
+/// For convenience, use `SharedFlatMap<K, V, S>` which aliases to 32 shards.
+pub struct FlatMapShared<K, V, S: BuildHasher, const N: usize> {
+    shards: [FlatMap<K, V, S>; N],
+}
+
+/// Default alias using 32 shards
+pub type SharedFlatMap<K, V, S = RandomState> = FlatMapShared<K, V, S, 32>;
+
+impl<K: Eq + Hash + Clone + 'static, V: Clone, const N: usize> FlatMapShared<K, V, RandomState, N> {
+    /// Create a new SharedFlatMap with default hasher per shard.
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// Create a new SharedFlatMap with the specified capacity for each shard.
+    #[inline(always)]
+    pub fn with_capacity(size_hint: usize) -> Self {
+        let shards =
+            std::array::from_fn(|_| FlatMap::<K, V, RandomState>::with_capacity(size_hint));
+        Self { shards }
+    }
+}
+
+impl<K: Eq + Hash + Clone + 'static, V: Clone, S: BuildHasher + Clone, const N: usize>
+    FlatMapShared<K, V, S, N>
+{
+    /// Create a new SharedFlatMap using the provided hasher cloned into each shard.
+    #[inline(always)]
+    pub fn with_hasher(hasher: S) -> Self {
+        Self::with_capacity_and_hasher(0, hasher)
+    }
+
+    /// Create a new SharedFlatMap with specified capacity and hasher for each shard.
+    #[inline(always)]
+    pub fn with_capacity_and_hasher(size_hint: usize, hasher: S) -> Self {
+        let shards = std::array::from_fn(|_| {
+            FlatMap::<K, V, S>::with_capacity_and_hasher(size_hint, hasher.clone())
+        });
+        Self { shards }
+    }
+
+    /// Internal: pick shard index by hashing the key with FlatMap's hash function.
+    #[inline(always)]
+    fn index_for(&self, key: &K) -> usize {
+        let (h64, _h2) = self.shards[0].hash_pair(key);
+        (h64 as usize) % N
+    }
+
+    // ============================================================================================
+    // PUBLIC API WRAPPERS (forced inline)
+    // ============================================================================================
+
+    /// Check whether the given key is present.
+    #[inline(always)]
+    pub fn contains_key(&self, key: &K) -> bool {
+        let i = self.index_for(key);
+        self.shards[i].contains_key(key)
+    }
+
+    /// Get the value associated with the given key as a cloned `V`.
+    #[inline(always)]
+    pub fn get(&self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let i = self.index_for(key);
+        self.shards[i].get(key)
+    }
+
+    /// Insert a key-value pair into the shared map.
+    #[inline(always)]
+    pub fn insert(&self, key: K, val: V) -> Option<V>
+    where
+        V: Clone,
+    {
+        let i = self.index_for(&key);
+        self.shards[i].insert(key, val)
+    }
+
+    /// Remove a key-value pair from the shared map.
+    #[inline(always)]
+    pub fn remove(&self, key: K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let i = self.index_for(&key);
+        self.shards[i].remove(key)
+    }
+
+    /// Get or insert with a closure.
+    #[inline(always)]
+    pub fn get_or_insert_with<F: FnOnce() -> V>(&self, key: K, f: F) -> (V, bool)
+    where
+        V: Clone,
+    {
+        let i = self.index_for(&key);
+        self.shards[i].get_or_insert_with(key, f)
+    }
+
+    /// Iterator over all key-value pairs as a Vec-backed iterator.
+    #[inline(always)]
+    pub fn iter(&self) -> std::vec::IntoIter<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+        S: BuildHasher + Default,
+    {
+        let mut items = Vec::new();
+        for shard in &self.shards {
+            items.extend(shard.into_iter());
+        }
+        items.into_iter()
+    }
+
+    /// Iterator over all keys as a Vec-backed iterator.
+    #[inline(always)]
+    pub fn keys(&self) -> std::vec::IntoIter<K>
+    where
+        K: Clone,
+        V: Clone,
+        S: BuildHasher + Default,
+    {
+        let mut keys = Vec::new();
+        for shard in &self.shards {
+            keys.extend(shard.into_iter().map(|(k, _)| k));
+        }
+        keys.into_iter()
+    }
+
+    /// Iterator over all values as a Vec-backed iterator.
+    #[inline(always)]
+    pub fn values(&self) -> std::vec::IntoIter<V>
+    where
+        K: Clone,
+        V: Clone,
+        S: BuildHasher + Default,
+    {
+        let mut vals = Vec::new();
+        for shard in &self.shards {
+            vals.extend(shard.into_iter().map(|(_, v)| v));
+        }
+        vals.into_iter()
+    }
+
+    /// Total number of pairs across all shards.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    /// Returns true if the map contains no elements across all shards.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Removes all key-value pairs from all shards.
+    #[inline(always)]
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.clear();
+        }
+    }
+
+    /// Apply a transformation to the value for the given key and return the old value.
+    #[inline(always)]
+    pub fn alter<F>(&self, key: K, f: F) -> Option<V>
+    where
+        F: FnOnce(Option<V>) -> Option<V>,
+    {
+        let i = self.index_for(&key);
+        self.shards[i].alter(key, f)
+    }
+}
+
+// ================================================================================================
 // BUCKET IMPLEMENTATION
 // ================================================================================================
 
 impl<K, V> Bucket<K, V> {
-    //#[inline(always)]
+    // #[inline(always)]
     // fn new() -> Self {
     //     Self {
     //         seq: AtomicU64::new(0),
@@ -1112,15 +1294,15 @@ impl<K, V> Bucket<K, V> {
 
             let bucket = &mut *ptr;
 
-            // Set meta to mark the first slot as occupied
-            // bucket.meta.store(set_byte(0, h2, 0), Ordering::Relaxed);
-            std::ptr::write(&mut bucket.meta, AtomicU64::from(set_byte(0, h2, 0)));
-
             // Set the first entry with our data
             let entries = &mut *bucket.entries.get();
             entries[0].set_hash(hash);
             entries[0].key.as_mut_ptr().write(key);
             entries[0].val.as_mut_ptr().write(val);
+
+            // Set meta to mark the first slot as occupied
+            // bucket.meta.store(set_byte(0, h2, 0), Ordering::Relaxed);
+            std::ptr::write(&mut bucket.meta, AtomicU64::from(set_byte(0, h2, 0)));
 
             ptr
         }

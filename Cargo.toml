@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "multi_thread_throughput"
 harness = false
+
+[[bench]]
+name = "drop_init_overhead"
+harness = false
